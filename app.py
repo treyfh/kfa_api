@@ -14,17 +14,40 @@ app = FastAPI(title="KFA API")
 def db():
     return psycopg2.connect(DATABASE_URL)
 
+from fastapi.responses import JSONResponse
+
+# --- Masking helper for safe logs ---
+def _mask(s):
+    return (s[:6] + "..." + s[-6:]) if s else "None"
+
+# --- Debug endpoint to inspect API key on Render ---
+@app.get("/debug/auth")
+def debug_auth():
+    return {
+        "expected_api_key_mask": _mask(API_KEY),
+        "expected_api_key_len": len(API_KEY) if API_KEY else 0,
+    }
+
+# --- Authentication middleware ---
 @app.middleware("http")
 async def require_key(request: Request, call_next):
-    if request.url.path == "/health":
+    # Allow these endpoints without API key
+    open_paths = {"/health", "/docs", "/openapi.json", "/debug/auth"}
+    if request.url.path in open_paths:
         return await call_next(request)
-    if request.headers.get("x-api-key") != API_KEY:
+
+    received = request.headers.get("x-api-key") or request.query_params.get("key")
+
+    if received != API_KEY:
+        print(f"[AUTH] Unauthorized | got={_mask(received)} (len={len(received) if received else 0}) "
+              f"| expected={_mask(API_KEY)} (len={len(API_KEY) if API_KEY else 0})")
         return JSONResponse({"error": "unauthorized"}, status_code=401)
+
     return await call_next(request)
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+# --- Log API key info on startup (masked) ---
+print(f"[DEBUG] Loaded API_KEY: { (API_KEY[:6]+'...'+API_KEY[-6:]) if API_KEY else 'None'} "
+      f"(len={len(API_KEY) if API_KEY else 0})")
 
 @app.get("/projects/by-number/{number}")
 def get_project_by_number(number: str):
@@ -210,3 +233,23 @@ app.add_middleware(
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
+@app.middleware("http")
+async def require_key(request: Request, call_next):
+    # allow docs and health without a key
+    open_paths = {"/health", "/docs", "/openapi.json"}
+    if request.url.path in open_paths:
+        return await call_next(request)
+
+    # accept header or query param for convenience
+    received = request.headers.get("x-api-key") or request.query_params.get("key")
+
+    if received != API_KEY:
+        # masked debug log
+        print(f"[AUTH] Unauthorized. Header/query key seen: "
+              f"{(received[:4] + '...' + received[-4:]) if received else 'None'} "
+              f"(len={len(received) if received else 0}); "
+              f"Expected: {(API_KEY[:4] + '...' + API_KEY[-4:]) if API_KEY else 'None'} "
+              f"(len={len(API_KEY) if API_KEY else 0})")
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    return await call_next(request)
