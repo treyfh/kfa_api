@@ -1,26 +1,51 @@
+# app.py  — KFA API (clean version)
 import os
+import io
+import csv
 import psycopg2
+from typing import Optional, List, Dict, Any
+
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
+# ---------------- Env & App ----------------
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
-API_KEY = os.getenv("API_KEY", "dev")
-print(f"[DEBUG] Loaded API_KEY: {API_KEY[:6]}...{API_KEY[-6:]} (len={len(API_KEY) if API_KEY else 0})")
+API_KEY = os.getenv("API_KEY", "dev")  # default only for local; set real key in Render
 
 app = FastAPI(title="KFA API")
 
+# CORS (you can replace "*" with your domain once deployed)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------- DB Helpers ----------------
 def db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
     return psycopg2.connect(DATABASE_URL)
 
-from fastapi.responses import JSONResponse
+def rows_to_dicts(cur) -> List[Dict[str, Any]]:
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
 
-# --- Masking helper for safe logs ---
-def _mask(s):
+# ---------------- Masked logging helpers ----------------
+def _mask(s: Optional[str]) -> str:
     return (s[:6] + "..." + s[-6:]) if s else "None"
 
-# --- Debug endpoint to inspect API key on Render ---
+print(f"[DEBUG] Loaded API_KEY: {_mask(API_KEY)} (len={len(API_KEY) if API_KEY else 0})")
+
+# ---------------- Open (no key) endpoints ----------------
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 @app.get("/debug/auth")
 def debug_auth():
     return {
@@ -28,8 +53,41 @@ def debug_auth():
         "expected_api_key_len": len(API_KEY) if API_KEY else 0,
     }
 
-# --- Authentication middleware ---
+@app.get("/debug/db")
+def debug_db():
+    try:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("select version()")
+        v = cur.fetchone()[0]
+        cur.close(); conn.close()
+        return {"db": "ok", "version": v}
+    except Exception as e:
+        return JSONResponse(
+            {"db": "error", "detail": str(e), "type": e.__class__.__name__},
+            status_code=500
+        )
 
+# ---------------- Authentication middleware (single) ----------------
+@app.middleware("http")
+async def require_key(request: Request, call_next):
+    # Paths that DO NOT require API key:
+    open_paths = {"/health", "/docs", "/openapi.json", "/debug/auth", "/debug/db"}
+    if request.url.path in open_paths:
+        return await call_next(request)
+
+    # Accept header OR ?key= query param
+    received = request.headers.get("x-api-key") or request.query_params.get("key")
+    if received != API_KEY:
+        print(
+            f"[AUTH] Unauthorized | got={_mask(received)} (len={len(received) if received else 0}) "
+            f"| expected={_mask(API_KEY)} (len={len(API_KEY) if API_KEY else 0})"
+        )
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    return await call_next(request)
+
+# ---------------- Project & Client Endpoints ----------------
 @app.get("/projects/by-number/{number}")
 def get_project_by_number(number: str):
     conn = db(); cur = conn.cursor()
@@ -59,14 +117,16 @@ def search_projects(text: str):
             order by number asc
             limit 50
         """, (q, q))
-        rows = cur.fetchall()
-        keys = ["id","number","name","status"]
-        return [dict(zip(keys, r)) for r in rows]
+        rows = rows_to_dicts(cur)
+        return rows
     finally:
         cur.close(); conn.close()
 
 @app.get("/projects")
-def list_projects(text: str | None = None, status: str | None = None, limit: int = 50, offset: int = 0):
+def list_projects(text: Optional[str] = None,
+                  status: Optional[str] = None,
+                  limit: int = 50,
+                  offset: int = 0):
     conn = db(); cur = conn.cursor()
     try:
         clauses, params = [], []
@@ -84,12 +144,11 @@ def list_projects(text: str | None = None, status: str | None = None, limit: int
             order by number asc
             limit %s offset %s
         """, (*params, limit, offset))
-        rows = cur.fetchall()
-        keys = ["id","number","name","status"]
-        return [dict(zip(keys, r)) for r in rows]
+        return rows_to_dicts(cur)
     finally:
         cur.close(); conn.close()
 
+# NOTE: singular to avoid route conflicts
 @app.get("/project/{project_id}")
 def get_project(project_id: int):
     conn = db(); cur = conn.cursor()
@@ -105,17 +164,22 @@ def get_project(project_id: int):
         return dict(zip(keys, row))
     finally:
         cur.close(); conn.close()
+
 @app.get("/clients")
 def list_clients(limit: int = 200):
     conn = db(); cur = conn.cursor()
     try:
         cur.execute("select id, name from clients order by name asc limit %s", (limit,))
-        rows = cur.fetchall()
-        return [{"id": r[0], "name": r[1]} for r in rows]
+        rows = rows_to_dicts(cur)
+        return rows
     finally:
         cur.close(); conn.close()
+
 @app.get("/projects/filter")
-def filter_projects(client: str | None = None, year_from: int | None = None, year_to: int | None = None, limit: int = 100):
+def filter_projects(client: Optional[str] = None,
+                    year_from: Optional[int] = None,
+                    year_to: Optional[int] = None,
+                    limit: int = 100):
     conn = db(); cur = conn.cursor()
     try:
         clauses, params = [], []
@@ -137,16 +201,13 @@ def filter_projects(client: str | None = None, year_from: int | None = None, yea
             order by p.number asc
             limit %s
         """, (*params, limit))
-        rows = cur.fetchall()
-        keys = ["id","number","name","status","start_year","completion_year","client"]
-        return [dict(zip(keys, r)) for r in rows]
+        rows = rows_to_dicts(cur)
+        return rows
     finally:
         cur.close(); conn.close()
-from fastapi.responses import StreamingResponse
-import io, csv
 
 @app.get("/projects/export.csv")
-def export_projects_csv(text: str | None = None, status: str | None = None):
+def export_projects_csv(text: Optional[str] = None, status: Optional[str] = None):
     conn = db(); cur = conn.cursor()
     try:
         clauses, params = [], []
@@ -164,17 +225,19 @@ def export_projects_csv(text: str | None = None, status: str | None = None):
             order by number asc
             limit 1000
         """, tuple(params))
-        rows = cur.fetchall()
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(["number","name","status","start_year","completion_year"])
-        writer.writerows(rows)
+        writer.writerows(cur.fetchall())
         output.seek(0)
-        return StreamingResponse(iter([output.getvalue()]),
-                                 media_type="text/csv",
-                                 headers={"Content-Disposition": "attachment; filename=projects.csv"})
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=projects.csv"}
+        )
     finally:
         cur.close(); conn.close()
+
 @app.get("/projects/address-search")
 def address_search(q: str, limit: int = 50):
     conn = db(); cur = conn.cursor()
@@ -186,9 +249,7 @@ def address_search(q: str, limit: int = 50):
             order by number asc
             limit %s
         """, (f"%{q}%", limit))
-        rows = cur.fetchall()
-        keys = ["id","number","name","status","address"]
-        return [dict(zip(keys, r)) for r in rows]
+        return rows_to_dicts(cur)
     finally:
         cur.close(); conn.close()
 
@@ -208,53 +269,5 @@ def projects_stats():
         return {"by_status": by_status, "by_year": by_year}
     finally:
         cur.close(); conn.close()
-from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
-)
-from fastapi.responses import JSONResponse
 
-# --- Masking helper for safe logs ---
-def _mask(s: str | None):
-    return (s[:6] + "..." + s[-6:]) if s else "None"
-
-# --- Debug endpoint to inspect API key on Render (SAFE: masked) ---
-@app.get("/debug/auth")
-def debug_auth():
-    return {
-        "expected_api_key_mask": _mask(API_KEY),
-        "expected_api_key_len": len(API_KEY) if API_KEY else 0,
-    }
-
-# --- Authentication middleware (single source of truth) ---
-@app.middleware("http")
-async def require_key(request: Request, call_next):
-    # Allow these paths without API key
-    open_paths = {"/health", "/docs", "/openapi.json", "/debug/auth"}
-    if request.url.path in open_paths:
-        return await call_next(request)
-
-    # Accept header OR query param for convenience
-    received = request.headers.get("x-api-key") or request.query_params.get("key")
-
-    if received != API_KEY:
-        print(
-            f"[AUTH] Unauthorized | got={_mask(received)} (len={len(received) if received else 0}) "
-            f"| expected={_mask(API_KEY)} (len={len(API_KEY) if API_KEY else 0})"
-        )
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    return await call_next(request)
-
-# --- Health (no key) ---
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-# --- Optional masked log on startup ---
-print(
-    f"[DEBUG] Loaded API_KEY: { _mask(API_KEY) } "
-    f"(len={len(API_KEY) if API_KEY else 0})"
-)
 
