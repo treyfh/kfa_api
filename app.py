@@ -315,5 +315,24 @@ def upsert_project_by_number(data: ProjectUpsert, request: Request):
         return {"ok": True, "id": new_id, "number": data.number}
     finally:
         cur.close(); conn.close()
+from fastapi import Request
 
+@app.delete("/projects/delete-by-number/{number}")
+def delete_project_by_number(number: str, request: Request):
+    # Auth (if your middleware already enforces it, keep this anyway for clarity)
+    key = request.headers.get("x-api-key") or request.query_params.get("key")
+    if key != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
 
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("delete from projects where number = %s returning id;", (number,))
+        row = cur.fetchone()
+        conn.commit()
+        if not row:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return {"ok": True, "deleted_project_number": number}
+    finally:
+        cur.close()
+        conn.close()
