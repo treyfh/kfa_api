@@ -269,5 +269,51 @@ def projects_stats():
         return {"by_status": by_status, "by_year": by_year}
     finally:
         cur.close(); conn.close()
+# ---------- WRITE ACCESS: Project Upsert by Number ----------
+from pydantic import BaseModel
+
+class ProjectUpsert(BaseModel):
+    number: str
+    name: str | None = None
+    status: str | None = None
+    client_id: int | None = None
+    start_year: int | None = None
+    completion_year: int | None = None
+    address: str | None = None
+
+@app.post("/projects/upsert-by-number")
+def upsert_project_by_number(data: ProjectUpsert, request: Request):
+    # Require API key (same protection as other endpoints)
+    key = request.headers.get("x-api-key") or request.query_params.get("key")
+    if key != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    conn = db(); cur = conn.cursor()
+    try:
+        # Ensure table has a unique index on number (safe if already exists)
+        cur.execute("""
+            create unique index if not exists projects_number_uidx on projects (number);
+        """)
+        conn.commit()
+
+        # Upsert by project number
+        cur.execute("""
+            insert into projects (number, name, status, client_id, start_year, completion_year, address)
+            values (%s,%s,%s,%s,%s,%s,%s)
+            on conflict (number) do update set
+              name = coalesce(excluded.name, projects.name),
+              status = coalesce(excluded.status, projects.status),
+              client_id = coalesce(excluded.client_id, projects.client_id),
+              start_year = coalesce(excluded.start_year, projects.start_year),
+              completion_year = coalesce(excluded.completion_year, projects.completion_year),
+              address = coalesce(excluded.address, projects.address)
+            returning id
+        """, (data.number, data.name, data.status, data.client_id,
+              data.start_year, data.completion_year, data.address))
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        return {"ok": True, "id": new_id, "number": data.number}
+    finally:
+        cur.close(); conn.close()
 
 
