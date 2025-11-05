@@ -336,3 +336,27 @@ def delete_project_by_number(number: str, request: Request):
     finally:
         cur.close()
         conn.close()
+from pydantic import BaseModel
+
+class ClientUpsert(BaseModel):
+    name: str
+
+@app.post("/clients/upsert-by-name")
+def upsert_client_by_name(data: ClientUpsert, request: Request):
+    key = request.headers.get("x-api-key") or request.query_params.get("key")
+    if key != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    conn = db(); cur = conn.cursor()
+    try:
+        cur.execute("""
+            insert into clients (name)
+            values (%s)
+            on conflict (name) do update set name = excluded.name
+            returning id
+        """, (data.name,))
+        cid = cur.fetchone()[0]
+        conn.commit()
+        return {"ok": True, "id": cid, "name": data.name}
+    finally:
+        cur.close(); conn.close()
