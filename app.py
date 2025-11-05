@@ -1,4 +1,4 @@
-# app.py — KFA API (clean, robust upsert)
+# app.py — KFA API (clean, robust upsert – create requires name)
 
 import os
 import io
@@ -270,8 +270,6 @@ def projects_stats():
         cur.close(); conn.close()
 
 # ---------------- WRITE Endpoints ----------------
-from typing import Optional
-from pydantic import BaseModel
 
 class ProjectUpsert(BaseModel):
     number: str
@@ -291,59 +289,57 @@ def upsert_project_by_number(data: ProjectUpsert, request: Request):
 
     conn = db(); cur = conn.cursor()
     try:
-        # IMPORTANT: ensure this exists ONCE (run in SQL console if needed):
-        #   create unique index if not exists projects_number_uidx on projects (number);
-
-        # 1) Get the project's id, inserting a minimal row if missing — single round trip
-        cur.execute("""
-            with ins as (
-              insert into projects (number)
-              values (%s)
-              on conflict (number) do nothing
-              returning id
-            ), sel as (
-              select id from projects where number = %s
-            )
-            select id from ins
-            union all
-            select id from sel
-            limit 1
-        """, (data.number, data.number))
+        # 1) Check if project already exists
+        cur.execute("select id from projects where number = %s", (data.number,))
         row = cur.fetchone()
-        if not row:
-            conn.rollback()
-            return JSONResponse({"error": "failed_to_locate_or_create"}, status_code=500)
-        project_id = row[0]
 
-        # 2) Build dynamic UPDATE only for fields provided
-        sets, params = [], []
-        if data.name is not None:
-            sets.append("name = %s"); params.append(data.name)
-        if data.status is not None:
-            sets.append("status = %s"); params.append(data.status)
-        if data.client_id is not None:
-            sets.append("client_id = %s"); params.append(data.client_id)
-        if data.start_year is not None:
-            sets.append("start_year = %s"); params.append(data.start_year)
-        if data.completion_year is not None:
-            sets.append("completion_year = %s"); params.append(data.completion_year)
-        if data.address is not None:
-            sets.append("address = %s"); params.append(data.address)
+        if row:
+            # ---- UPDATE EXISTING (partial) ----
+            project_id = row[0]
+            sets, params = [], []
+            if data.name is not None:
+                sets.append("name = %s"); params.append(data.name)
+            if data.status is not None:
+                sets.append("status = %s"); params.append(data.status)
+            if data.client_id is not None:
+                sets.append("client_id = %s"); params.append(data.client_id)
+            if data.start_year is not None:
+                sets.append("start_year = %s"); params.append(data.start_year)
+            if data.completion_year is not None:
+                sets.append("completion_year = %s"); params.append(data.completion_year)
+            if data.address is not None:
+                sets.append("address = %s"); params.append(data.address)
 
-        if sets:
-            sql = f"update projects set {', '.join(sets)} where id = %s"
-            params.append(project_id)
-            cur.execute(sql, tuple(params))
+            if sets:
+                sql = f"update projects set {', '.join(sets)} where id = %s"
+                params.append(project_id)
+                cur.execute(sql, tuple(params))
+                conn.commit()
 
-        conn.commit()
-        return {"ok": True, "id": project_id, "number": data.number}
+            return {"ok": True, "id": project_id, "number": data.number}
+
+        else:
+            # ---- CREATE NEW (must satisfy NOT NULLs) ----
+            if data.name is None:
+                return JSONResponse(
+                    {"error": "missing_required_on_create",
+                     "detail": "Your table requires 'name' (NOT NULL) when creating a new project."},
+                    status_code=400
+                )
+
+            cur.execute("""
+                insert into projects (number, name, status, client_id, start_year, completion_year, address)
+                values (%s,%s,%s,%s,%s,%s,%s)
+                returning id
+            """, (data.number, data.name, data.status, data.client_id,
+                  data.start_year, data.completion_year, data.address))
+            project_id = cur.fetchone()[0]
+            conn.commit()
+            return {"ok": True, "id": project_id, "number": data.number}
+
     except Exception as e:
-        # Return a helpful error so we can see exactly why it 500s
         conn.rollback()
-        return JSONResponse(
-            {"error": "upsert_failed", "detail": str(e), "type": e.__class__.__name__},
-            status_code=500
-        )
+        return JSONResponse({"error": "upsert_failed", "detail": str(e), "type": e.__class__.__name__}, status_code=500)
     finally:
         cur.close(); conn.close()
 
