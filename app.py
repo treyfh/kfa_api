@@ -1,23 +1,25 @@
-# app.py  — KFA API (clean version)
+# app.py — KFA API (clean, robust upsert)
+
 import os
 import io
 import csv
 import psycopg2
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, Request, File, UploadFile
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 # ---------------- Env & App ----------------
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
-API_KEY = os.getenv("API_KEY", "dev")  # default only for local; set real key in Render
+API_KEY = os.getenv("API_KEY", "dev")  # set a real key in Render
 
 app = FastAPI(title="KFA API")
 
-# CORS (you can replace "*" with your domain once deployed)
+# CORS (tighten allow_origins in prod if you want)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -68,7 +70,7 @@ def debug_db():
             status_code=500
         )
 
-# ---------------- Authentication middleware (single) ----------------
+# ---------------- Authentication middleware ----------------
 @app.middleware("http")
 async def require_key(request: Request, call_next):
     # Paths that DO NOT require API key:
@@ -87,7 +89,7 @@ async def require_key(request: Request, call_next):
 
     return await call_next(request)
 
-# ---------------- Project & Client Endpoints ----------------
+# ---------------- READ Endpoints ----------------
 @app.get("/projects/by-number/{number}")
 def get_project_by_number(number: str):
     conn = db(); cur = conn.cursor()
@@ -117,8 +119,7 @@ def search_projects(text: str):
             order by number asc
             limit 50
         """, (q, q))
-        rows = rows_to_dicts(cur)
-        return rows
+        return rows_to_dicts(cur)
     finally:
         cur.close(); conn.close()
 
@@ -148,7 +149,7 @@ def list_projects(text: Optional[str] = None,
     finally:
         cur.close(); conn.close()
 
-# NOTE: singular to avoid route conflicts
+# singular naming to avoid conflicts
 @app.get("/project/{project_id}")
 def get_project(project_id: int):
     conn = db(); cur = conn.cursor()
@@ -170,8 +171,7 @@ def list_clients(limit: int = 200):
     conn = db(); cur = conn.cursor()
     try:
         cur.execute("select id, name from clients order by name asc limit %s", (limit,))
-        rows = rows_to_dicts(cur)
-        return rows
+        return rows_to_dicts(cur)
     finally:
         cur.close(); conn.close()
 
@@ -201,8 +201,7 @@ def filter_projects(client: Optional[str] = None,
             order by p.number asc
             limit %s
         """, (*params, limit))
-        rows = rows_to_dicts(cur)
-        return rows
+        return rows_to_dicts(cur)
     finally:
         cur.close(); conn.close()
 
@@ -269,63 +268,74 @@ def projects_stats():
         return {"by_status": by_status, "by_year": by_year}
     finally:
         cur.close(); conn.close()
-# ---------- WRITE ACCESS: Project Upsert by Number ----------
-from pydantic import BaseModel
 
+# ---------------- WRITE Endpoints ----------------
 class ProjectUpsert(BaseModel):
     number: str
-    name: str | None = None
-    status: str | None = None
-    client_id: int | None = None
-    start_year: int | None = None
-    completion_year: int | None = None
-    address: str | None = None
+    name: Optional[str] = None
+    status: Optional[str] = None
+    client_id: Optional[int] = None
+    start_year: Optional[int] = None
+    completion_year: Optional[int] = None
+    address: Optional[str] = None
 
 @app.post("/projects/upsert-by-number")
 def upsert_project_by_number(data: ProjectUpsert, request: Request):
-    # Require API key (same protection as other endpoints)
+    # Auth is enforced by middleware; keep explicit check for clarity
     key = request.headers.get("x-api-key") or request.query_params.get("key")
     if key != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
     conn = db(); cur = conn.cursor()
     try:
-        # Ensure table has a unique index on number (safe if already exists)
+        # IMPORTANT: Create the unique index ONCE outside the request (run this in SQL console):
+        #   create unique index if not exists projects_number_uidx on projects (number);
+        #
+        # 1) Ensure a row exists for this number — insert only 'number' to avoid NOT NULL on other cols.
         cur.execute("""
-            create unique index if not exists projects_number_uidx on projects (number);
-        """)
-        conn.commit()
-
-        # Upsert by project number
-        cur.execute("""
-            insert into projects (number, name, status, client_id, start_year, completion_year, address)
-            values (%s,%s,%s,%s,%s,%s,%s)
-            on conflict (number) do update set
-              name = coalesce(excluded.name, projects.name),
-              status = coalesce(excluded.status, projects.status),
-              client_id = coalesce(excluded.client_id, projects.client_id),
-              start_year = coalesce(excluded.start_year, projects.start_year),
-              completion_year = coalesce(excluded.completion_year, projects.completion_year),
-              address = coalesce(excluded.address, projects.address)
+            insert into projects (number)
+            values (%s)
+            on conflict (number) do nothing
             returning id
-        """, (data.number, data.name, data.status, data.client_id,
-              data.start_year, data.completion_year, data.address))
-        new_id = cur.fetchone()[0]
+        """, (data.number,))
+        row = cur.fetchone()
+        if not row:
+            cur.execute("select id from projects where number = %s", (data.number,))
+            row = cur.fetchone()
+        project_id = row[0]
+
+        # 2) Build dynamic UPDATE only for explicitly provided fields
+        sets, params = [], []
+        if data.name is not None:
+            sets.append("name = %s"); params.append(data.name)
+        if data.status is not None:
+            sets.append("status = %s"); params.append(data.status)
+        if data.client_id is not None:
+            sets.append("client_id = %s"); params.append(data.client_id)
+        if data.start_year is not None:
+            sets.append("start_year = %s"); params.append(data.start_year)
+        if data.completion_year is not None:
+            sets.append("completion_year = %s"); params.append(data.completion_year)
+        if data.address is not None:
+            sets.append("address = %s"); params.append(data.address)
+
+        if sets:
+            sql = f"update projects set {', '.join(sets)} where id = %s"
+            params.append(project_id)
+            cur.execute(sql, tuple(params))
+
         conn.commit()
-        return {"ok": True, "id": new_id, "number": data.number}
+        return {"ok": True, "id": project_id, "number": data.number}
     finally:
         cur.close(); conn.close()
-from fastapi import Request
 
 @app.delete("/projects/delete-by-number/{number}")
 def delete_project_by_number(number: str, request: Request):
-    # Auth (if your middleware already enforces it, keep this anyway for clarity)
     key = request.headers.get("x-api-key") or request.query_params.get("key")
     if key != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
-    conn = db()
-    cur = conn.cursor()
+    conn = db(); cur = conn.cursor()
     try:
         cur.execute("delete from projects where number = %s returning id;", (number,))
         row = cur.fetchone()
@@ -334,9 +344,7 @@ def delete_project_by_number(number: str, request: Request):
             return JSONResponse({"error": "not found"}, status_code=404)
         return {"ok": True, "deleted_project_number": number}
     finally:
-        cur.close()
-        conn.close()
-from pydantic import BaseModel
+        cur.close(); conn.close()
 
 class ClientUpsert(BaseModel):
     name: str
