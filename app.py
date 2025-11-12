@@ -1,5 +1,10 @@
 # app.py — KFA API (projects, clients, file storage with optional Google Drive)
-# Version 1.0.4 (adds local download route, stronger Drive diagnostics, minor fixes)
+# Version 1.0.9
+# - Adds /debug/version to verify the deployed file + version + mtime
+# - Logs version at startup
+# - Keeps: Drive/local auto-switch, uploads, import-from-url, list, download, delete
+# - Project: search, by-id, by-number(ILIKE), upsert, delete
+# - Debug routes left open for setup convenience
 
 import os
 import io
@@ -7,13 +12,14 @@ import uuid
 import logging
 import mimetypes
 import pathlib
-import requests
-from typing import Optional, List, Dict, Any, Tuple
+import time
+from typing import Optional, Tuple
 
+import requests
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 
-from fastapi import FastAPI, Request, File, UploadFile, Body
+from fastapi import FastAPI, Request, File, UploadFile
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -37,8 +43,8 @@ API_KEY = os.getenv("API_KEY", "dev")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # Google Drive config
-GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")
-GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")  # ID only
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")  # e.g. /etc/secrets/deep_files.json
 GDRIVE_PUBLIC = os.getenv("GDRIVE_PUBLIC", "0").lower() in {"1", "true", "yes"}
 
 # CORS
@@ -57,11 +63,9 @@ logger = logging.getLogger("kfa_api")
 def _mask(s: Optional[str]) -> str:
     return (s[:6] + "..." + s[-6:]) if s else "None"
 
-logger.info("Starting KFA API | API_KEY=%s | DB_URL=%s",
-            _mask(API_KEY), _mask(DATABASE_URL))
-
 # ---------------- FastAPI ----------------
-app = FastAPI(title="KFA API", version="1.0.4")
+APP_VERSION = "1.0.9"
+app = FastAPI(title="KFA API", version=APP_VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -71,6 +75,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Serve local files for previews
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
@@ -84,6 +89,10 @@ def _ensure_database_url():
 @app.on_event("startup")
 def _startup():
     global _POOL
+    logger.info(
+        "Starting KFA API v%s | API_KEY=%s | DB_URL=%s",
+        APP_VERSION, _mask(API_KEY), _mask(DATABASE_URL)
+    )
     try:
         _ensure_database_url()
         _POOL = SimpleConnectionPool(minconn=1, maxconn=5, dsn=DATABASE_URL)
@@ -114,9 +123,15 @@ def close_conn(conn):
         try:
             _POOL.putconn(conn)
         except Exception:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
     else:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 def rows_to_dicts(cur):
     cols = [c[0] for c in cur.description]
@@ -172,6 +187,10 @@ def storage_mode() -> str:
     ok, _ = _probe_drive()
     return "drive" if ok else "local"
 
+def _infer_mime(filename: str, fallback: str = "application/octet-stream") -> str:
+    mime, _ = mimetypes.guess_type(filename)
+    return mime or fallback
+
 def _drive_upload(name: str, content: bytes, mime: Optional[str]):
     svc = _drive()
     media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime or "application/octet-stream", resumable=False)
@@ -197,11 +216,24 @@ def _drive_file_links(file_id: str):
 # ---------------- Open routes ----------------
 @app.get("/")
 def root():
-    return {"service": "KFA API", "version": "1.0.4", "storage": storage_mode()}
+    return {"service": "KFA API", "version": APP_VERSION, "storage": storage_mode()}
 
 @app.get("/health")
 def health():
     return {"ok": True, "storage": storage_mode()}
+
+@app.get("/debug/version")
+def debug_version():
+    try:
+        fn = __file__
+    except Exception:
+        fn = "unknown"
+    try:
+        mtime = os.path.getmtime(__file__)
+        mtime_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime))
+    except Exception:
+        mtime_iso = None
+    return {"version": APP_VERSION, "file": fn, "file_mtime_utc": mtime_iso}
 
 @app.get("/debug/auth")
 def debug_auth():
@@ -260,12 +292,11 @@ def _extract_api_key(request: Request):
 
 OPEN_PATH_PREFIXES = (
     "/uploads",
-    "/docs",          # includes swagger UI assets
+    "/docs",
     "/openapi.json",
     "/redoc",
 )
-
-OPEN_PATHS_EXACT = {"/", "/health", "/debug/auth", "/debug/db", "/debug/storage", "/debug/drive-ping"}
+OPEN_PATHS_EXACT = {"/", "/health", "/debug/version", "/debug/auth", "/debug/db", "/debug/storage", "/debug/drive-ping"}
 
 @app.middleware("http")
 async def require_key(request: Request, call_next):
@@ -295,14 +326,10 @@ class FileImportBody(BaseModel):
     content_type: Optional[str] = None
 
 # ---------------- Helpers ----------------
-def _get_project_id(cur, number):
+def _get_project_id(cur, number: str) -> Optional[int]:
     cur.execute("select id from projects where number=%s", (number,))
     row = cur.fetchone()
     return row[0] if row else None
-
-def _infer_mime(filename: str, fallback: str = "application/octet-stream") -> str:
-    mime, _ = mimetypes.guess_type(filename)
-    return mime or fallback
 
 # ---------------- Project & Client Routes ----------------
 @app.get("/projects/search")
@@ -320,12 +347,42 @@ def search_projects(text: str = ""):
     finally:
         cur.close(); close_conn(conn)
 
-@app.get("/clients")
-def list_clients(limit: int = 200):
+@app.get("/projects/by-id/{pid}")
+def get_project_by_id(pid: int):
     conn = db(); cur = conn.cursor()
     try:
-        cur.execute("select id, name from clients order by name asc limit %s", (limit,))
-        return rows_to_dicts(cur)
+        cur.execute("""
+            select id, number, name, status, start_year, completion_year, address
+            from projects where id=%s
+        """, (pid,))
+        row = cur.fetchone()
+        if not row:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        keys = ["id","number","name","status","start_year","completion_year","address"]
+        return dict(zip(keys, row))
+    finally:
+        cur.close(); close_conn(conn)
+
+@app.get("/projects/by-number/{number}")
+def get_project_by_number(number: str):
+    """
+    Forgiving: behaves like search on 'number' and returns the newest match.
+    """
+    conn = db(); cur = conn.cursor()
+    try:
+        q = f"%{number.strip()}%"
+        cur.execute("""
+            select id, number, name, status, start_year, completion_year, address
+            from projects
+            where number ilike %s
+            order by id desc
+            limit 1
+        """, (q,))
+        row = cur.fetchone()
+        if not row:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        keys = ["id","number","name","status","start_year","completion_year","address"]
+        return dict(zip(keys, row))
     finally:
         cur.close(); close_conn(conn)
 
@@ -363,6 +420,30 @@ def upsert_project_by_number(data: ProjectUpsert, request: Request):
     finally:
         cur.close(); close_conn(conn)
 
+@app.delete("/projects/delete-by-number/{number}")
+def delete_project_by_number(number: str, request: Request):
+    if _extract_api_key(request) != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    conn = db(); cur = conn.cursor()
+    try:
+        cur.execute("delete from projects where number=%s returning id", (number,))
+        row = cur.fetchone()
+        conn.commit()
+        if not row:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        return {"ok": True, "deleted_project_number": number}
+    finally:
+        cur.close(); close_conn(conn)
+
+@app.get("/clients")
+def list_clients(limit: int = 200):
+    conn = db(); cur = conn.cursor()
+    try:
+        cur.execute("select id, name from clients order by name asc limit %s", (limit,))
+        return rows_to_dicts(cur)
+    finally:
+        cur.close(); close_conn(conn)
+
 @app.post("/clients/upsert-by-name")
 def upsert_client_by_name(data: ClientUpsert, request: Request):
     if _extract_api_key(request) != API_KEY:
@@ -397,7 +478,7 @@ async def upload_project_file(number: str, file: UploadFile = File(...), request
 
         data = await file.read()
         fname = file.filename or f"upload-{uuid.uuid4().hex}"
-        mime = file.content_type or _infer_mime(fname)
+        mime = (file.content_type or _infer_mime(fname)).split(";")[0].strip()
 
         if storage_mode() == "drive":
             meta = _drive_upload(fname, data, mime)
@@ -430,7 +511,7 @@ async def upload_project_file(number: str, file: UploadFile = File(...), request
         """, (pid, fname, mime, None, local_path))
         fid = cur.fetchone()[0]
         conn.commit()
-        preview = f"/uploads/{os.path.basename(local_path)}" if mime.startswith("image/") else None
+        preview = f"/uploads/{os.path.basename(local_path)}" if (mime or "").startswith("image/") else None
         return {
             "ok": True,
             "file_id": fid,
@@ -460,7 +541,7 @@ def import_file_from_url(number: str, data: FileImportBody, request: Request):
         resp.raise_for_status()
 
         fname = data.filename or os.path.basename(data.url.split("?")[0]) or f"import-{uuid.uuid4().hex}"
-        mime = data.content_type or resp.headers.get("Content-Type") or _infer_mime(fname)
+        mime = (data.content_type or resp.headers.get("Content-Type") or _infer_mime(fname)).split(";")[0].strip()
         content = resp.content
 
         if storage_mode() == "drive":
@@ -508,13 +589,48 @@ def import_file_from_url(number: str, data: FileImportBody, request: Request):
     finally:
         cur.close(); close_conn(conn)
 
-# ---------------- Local download route (missing before) ----------------
+# ---------------- List files ----------------
+@app.get("/projects/{number}/files")
+def list_project_files(number: str, request: Request):
+    if _extract_api_key(request) != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    conn = db(); cur = conn.cursor()
+    try:
+        pid = _get_project_id(cur, number)
+        if not pid:
+            return []
+        cur.execute("""
+            select id, filename, content_type, drive_id, local_path, created_at
+            from project_files
+            where project_id=%s
+            order by created_at desc nulls last, id desc
+        """, (pid,))
+        rows = rows_to_dicts(cur)
+
+        mode = storage_mode()
+        out = []
+        for r in rows:
+            item = dict(r)
+            if mode == "drive" and r.get("drive_id"):
+                try:
+                    links = _drive_file_links(r["drive_id"])
+                    item["download"] = links["download"]
+                    if (r.get("content_type") or "").startswith("image/"):
+                        item["preview"] = links["view"]
+                except Exception:
+                    item["download"] = None
+            else:
+                item["download"] = f"/projects/{number}/files/local/{r['id']}"
+                if (r.get("content_type") or "").startswith("image/") and r.get("local_path"):
+                    item["preview"] = f"/uploads/{os.path.basename(r['local_path'])}"
+            out.append(item)
+        return out
+    finally:
+        cur.close(); close_conn(conn)
+
+# ---------------- Local download route ----------------
 @app.get("/projects/{number}/files/local/{fid}")
 def download_local_file(number: str, fid: int, request: Request):
-    """
-    Returns the raw file bytes for a locally stored file.
-    Validates that the file belongs to the specified project number.
-    """
     if _extract_api_key(request) != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     conn = db(); cur = conn.cursor()
@@ -539,5 +655,39 @@ def download_local_file(number: str, fid: int, request: Request):
         return FileResponse(path, media_type=ctype or _infer_mime(fname), headers=headers)
     except Exception as e:
         return JSONResponse({"error": "download_failed", "detail": str(e)}, status_code=500)
+    finally:
+        cur.close(); close_conn(conn)
+
+# ---------------- Delete file ----------------
+@app.delete("/projects/{number}/files/{file_id}")
+def delete_project_file(number: str, file_id: int, request: Request):
+    if _extract_api_key(request) != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    conn = db(); cur = conn.cursor()
+    try:
+        pid = _get_project_id(cur, number)
+        if not pid:
+            return JSONResponse({"error": "project_not_found"}, status_code=404)
+
+        cur.execute("select drive_id, local_path from project_files where id=%s and project_id=%s", (file_id, pid))
+        row = cur.fetchone()
+        if not row:
+            return JSONResponse({"error": "file_not_found"}, status_code=404)
+        drive_id, local_path = row
+
+        if drive_id and storage_mode() == "drive":
+            try:
+                _drive().files().delete(fileId=drive_id).execute()
+            except Exception:
+                pass
+        if local_path and os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+
+        cur.execute("delete from project_files where id=%s and project_id=%s", (file_id, pid))
+        conn.commit()
+        return {"ok": True, "deleted_file_id": file_id}
     finally:
         cur.close(); close_conn(conn)
