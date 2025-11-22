@@ -1,16 +1,18 @@
-# app.py — DEEP+ API (projects, clients, file storage with optional Google Drive)
-# Version 1.1.4 (Neon projects schema aligned)
-# - DB columns aligned to user's Neon schema:
+# app.py — DEEP+ API (projects, clients, staff, file storage with optional Google Drive)
+# Version 1.1.5 (Neon schema aligned)
+# - Projects table columns aligned to user's Neon schema:
 #   project_number, project_name, project_status, client_id, start_year, completion_year,
 #   country, address, project_type, project_context, project_description,
 #   project_height_m, gross_floor_area_m2, number_of_stories, residential_units,
 #   commercial_units, bicycle_parking, vehicular_parking
+# - Staff table columns aligned to user's Neon schema:
+#   id, first_name, last_name, role, email, phone_number, project_teams
 # - API keeps compatibility fields:
 #   number -> project_number, name -> project_name, status -> project_status
 # - Shared Drive–friendly Google Drive uploads (supportsAllDrives=True)
 # - Stricter Drive probe (checks folder ID directly)
 # - Logs service account email used for Drive
-# - Keeps Drive/local auto-switch, uploads, list, download, delete, project/client CRUD
+# - Keeps Drive/local auto-switch, uploads, list, download, delete, project/client/staff CRUD
 # - /images/search endpoint for chatbot image lookup
 
 import os
@@ -81,7 +83,7 @@ logger.info(
 )
 
 # ---------------- FastAPI ----------------
-app = FastAPI(title="DEEP+ API", version="1.1.4")
+app = FastAPI(title="DEEP+ API", version="1.1.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -350,7 +352,7 @@ class ProjectUpsert(BaseModel):
     name: Optional[str] = None
     status: Optional[str] = None
 
-    # Your Neon columns (all optional)
+    # Neon columns (optional)
     client_id: Optional[int] = None
     start_year: Optional[int] = None
     completion_year: Optional[int] = None
@@ -370,6 +372,15 @@ class ProjectUpsert(BaseModel):
 
 class ClientUpsert(BaseModel):
     name: str
+
+
+class StaffUpsert(BaseModel):
+    first_name: str
+    last_name: str
+    role: Optional[str] = None
+    email: Optional[str] = None
+    phone_number: Optional[str] = None
+    project_teams: Optional[str] = None  # stored as text/json string
 
 
 class FileImportBody(BaseModel):
@@ -536,7 +547,6 @@ def upsert_project_by_number(data: ProjectUpsert, request: Request):
         cur.execute("select id from projects where project_number=%s", (data.number,))
         row = cur.fetchone()
 
-        # Map API fields -> DB columns
         field_map: Dict[str, str] = {
             "name": "project_name",
             "status": "project_status",
@@ -576,7 +586,6 @@ def upsert_project_by_number(data: ProjectUpsert, request: Request):
 
             return {"ok": True, "id": pid, "number": data.number}
 
-        # Insert new project
         cur.execute(
             """
             insert into projects (
@@ -674,6 +683,7 @@ def list_clients(limit: int = 200):
 def upsert_client_by_name(data: ClientUpsert, request: Request):
     if _extract_api_key(request) != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
+
     conn = db()
     cur = conn.cursor()
     try:
@@ -698,6 +708,106 @@ def upsert_client_by_name(data: ClientUpsert, request: Request):
         close_conn(conn)
 
 
+# ---------------- Staff ----------------
+@app.get("/staff")
+def list_staff(limit: int = 500, request: Request = None):
+    if _extract_api_key(request) != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            select
+                id,
+                first_name,
+                last_name,
+                role,
+                email,
+                phone_number,
+                project_teams
+            from staff
+            order by last_name asc, first_name asc
+            limit %s
+            """,
+            (limit,),
+        )
+        return rows_to_dicts(cur)
+    finally:
+        cur.close()
+        close_conn(conn)
+
+
+@app.post("/staff/upsert")
+def upsert_staff(data: StaffUpsert, request: Request):
+    """
+    Upsert staff by email if provided, else by (first_name,last_name).
+    This avoids needing a UNIQUE(name) constraint if you don't want one.
+    """
+    if _extract_api_key(request) != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    conn = db()
+    cur = conn.cursor()
+    try:
+        if data.email:
+            cur.execute("select id from staff where email=%s", (data.email,))
+        else:
+            cur.execute(
+                "select id from staff where first_name=%s and last_name=%s",
+                (data.first_name, data.last_name),
+            )
+        row = cur.fetchone()
+
+        if row:
+            sid = row[0]
+            sets, params = [], []
+            for field in ["first_name", "last_name", "role", "email", "phone_number", "project_teams"]:
+                val = getattr(data, field)
+                if val is not None:
+                    sets.append(f"{field}=%s")
+                    params.append(val)
+            params.append(sid)
+            cur.execute(f"update staff set {', '.join(sets)} where id=%s", tuple(params))
+            conn.commit()
+            return {"ok": True, "id": sid, "first_name": data.first_name, "last_name": data.last_name}
+
+        cur.execute(
+            """
+            insert into staff (
+                first_name,
+                last_name,
+                role,
+                email,
+                phone_number,
+                project_teams
+            )
+            values (%s,%s,%s,%s,%s,%s)
+            returning id
+            """,
+            (
+                data.first_name,
+                data.last_name,
+                data.role,
+                data.email,
+                data.phone_number,
+                data.project_teams,
+            ),
+        )
+        sid = cur.fetchone()[0]
+        conn.commit()
+        return {"ok": True, "id": sid, "first_name": data.first_name, "last_name": data.last_name}
+
+    except Exception as e:
+        conn.rollback()
+        logger.exception("staff/upsert failed")
+        return JSONResponse({"error": "staff_upsert_failed", "detail": str(e)}, status_code=500)
+    finally:
+        cur.close()
+        close_conn(conn)
+
+
 # ---------------- File upload ----------------
 @app.post("/projects/{number}/files")
 async def upload_project_file(
@@ -715,12 +825,12 @@ async def upload_project_file(
         if not pid:
             return JSONResponse({"error": "project_not_found"}, status_code=404)
 
-        data = await file.read()
+        data_bytes = await file.read()
         fname = file.filename or f"upload-{uuid.uuid4().hex}"
         mime = (file.content_type or _infer_mime(fname)).split(";")[0].strip()
 
         if storage_mode() == "drive":
-            meta = _drive_upload(fname, data, mime)
+            meta = _drive_upload(fname, data_bytes, mime)
             drive_id = meta["id"]
             cur.execute(
                 """
@@ -741,12 +851,11 @@ async def upload_project_file(
                 "preview": meta.get("webViewLink"),
             }
 
-        # local fallback
         ext = os.path.splitext(fname)[1] or ".bin"
         safe_name = f"{number}_{uuid.uuid4().hex}{ext}"
         local_path = os.path.join("uploads", os.path.basename(safe_name))
         with open(local_path, "wb") as f:
-            f.write(data)
+            f.write(data_bytes)
 
         cur.execute(
             """
