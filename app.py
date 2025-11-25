@@ -1,19 +1,10 @@
 # app.py — DEEP+ API (projects, clients, staff, file storage with optional Google Drive)
-# Version 1.1.5 (Neon schema aligned)
-# - Projects table columns aligned to user's Neon schema:
-#   project_number, project_name, project_status, client_id, start_year, completion_year,
-#   country, address, project_type, project_context, project_description,
-#   project_height_m, gross_floor_area_m2, number_of_stories, residential_units,
-#   commercial_units, bicycle_parking, vehicular_parking
-# - Staff table columns aligned to user's Neon schema:
-#   id, first_name, last_name, role, email, phone_number, project_teams
-# - API keeps compatibility fields:
-#   number -> project_number, name -> project_name, status -> project_status
-# - Shared Drive–friendly Google Drive uploads (supportsAllDrives=True)
-# - Stricter Drive probe (checks folder ID directly)
-# - Logs service account email used for Drive
-# - Keeps Drive/local auto-switch, uploads, list, download, delete, project/client/staff CRUD
-# - /images/search endpoint for chatbot image lookup
+# Version 1.1.7 (deploy stamp + DB hardening + better staff diagnostics)
+# - Projects DB columns aligned to user's Neon schema.
+# - Staff DB table/columns aligned:
+#   public.staff(id, first_name, last_name, role, email, phone_number)
+# - Drive/local auto-switch, uploads, list, download, delete, CRUD, images search.
+# - Debug endpoints to prove deploy + diagnose staff.
 
 import os
 import io
@@ -23,11 +14,12 @@ import mimetypes
 import pathlib
 import socket
 from urllib.parse import urlparse
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Any
 
 import requests
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
+from psycopg2 import OperationalError, InterfaceError
 
 from fastapi import FastAPI, Request, File, UploadFile, Query
 from fastapi.responses import JSONResponse, FileResponse
@@ -51,6 +43,9 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 API_KEY = os.getenv("API_KEY", "dev")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# Give yourself a hard proof that THIS code is live
+BUILD_STAMP = os.getenv("BUILD_STAMP", "2025-11-25b")
 
 # Google Drive config
 GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")
@@ -76,14 +71,15 @@ def _mask(s: Optional[str]) -> str:
 
 
 logger.info(
-    "Starting DEEP+ API | API_KEY=%s | DB_URL=%s | GDRIVE_FOLDER_ID=%s",
+    "Starting DEEP+ API | API_KEY=%s | DB_URL=%s | GDRIVE_FOLDER_ID=%s | BUILD=%s",
     _mask(API_KEY),
     _mask(DATABASE_URL),
     _mask(GDRIVE_FOLDER_ID),
+    BUILD_STAMP,
 )
 
 # ---------------- FastAPI ----------------
-app = FastAPI(title="DEEP+ API", version="1.1.5")
+app = FastAPI(title="DEEP+ API", version="1.1.7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -96,6 +92,31 @@ app.add_middleware(
 # serve local files for previews
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+# ---------------- Auth middleware ----------------
+def _extract_api_key(request: Request):
+    hdr = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+    if hdr:
+        return hdr
+    auth = request.headers.get("authorization")
+    if auth and auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    qp = request.query_params.get("key")
+    return qp
+
+
+OPEN_PATH_PREFIXES = ("/uploads", "/docs", "/openapi.json", "/redoc")
+OPEN_PATHS_EXACT = {"/", "/health", "/debug/auth", "/debug/db", "/debug/storage"}
+
+
+@app.middleware("http")
+async def require_key(request: Request, call_next):
+    path = request.url.path
+    if (path in OPEN_PATHS_EXACT) or any(path.startswith(p) for p in OPEN_PATH_PREFIXES):
+        return await call_next(request)
+    if _extract_api_key(request) != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return await call_next(request)
 
 # ---------------- DB Pool ----------------
 _POOL: Optional[SimpleConnectionPool] = None
@@ -115,7 +136,7 @@ def _startup():
         logger.info("DB connection pool initialized")
     except Exception as e:
         _POOL = None
-        logger.error("DB pool init failed: %s", e)
+        logger.exception("DB pool init failed")
 
 
 @app.on_event("shutdown")
@@ -127,11 +148,35 @@ def _shutdown():
 
 
 def db():
+    """
+    Get a live connection.
+    If pool returns a dead connection, retry once.
+    """
     global _POOL
+    _ensure_database_url()
+
     if _POOL is None:
-        _ensure_database_url()
         return psycopg2.connect(DATABASE_URL)
-    return _POOL.getconn()
+
+    conn = _POOL.getconn()
+    try:
+        # quick liveness check
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        return conn
+    except (OperationalError, InterfaceError):
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
+            _POOL.putconn(conn, close=True)
+        except Exception:
+            pass
+        # retry once with a fresh conn
+        conn2 = _POOL.getconn()
+        return conn2
 
 
 def close_conn(conn):
@@ -156,7 +201,6 @@ def close_conn(conn):
 def rows_to_dicts(cur):
     cols = [c[0] for c in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
-
 
 # ---------------- Storage Mode & Drive Helpers ----------------
 _drive_svc = None
@@ -270,11 +314,15 @@ def _drive_file_links(file_id: str):
         "mime": f.get("mimeType"),
     }
 
-
 # ---------------- Open routes ----------------
 @app.get("/")
 def root():
-    return {"service": "DEEP+ API", "version": app.version, "storage": storage_mode()}
+    return {
+        "service": "DEEP+ API",
+        "version": app.version,
+        "build": BUILD_STAMP,
+        "storage": storage_mode(),
+    }
 
 
 @app.get("/health")
@@ -296,13 +344,13 @@ def debug_db():
         cur.execute("select version()")
         v = cur.fetchone()[0]
         cur.close()
-        close_conn(conn)
-        conn = None
         return {"db": "ok", "version": v}
     except Exception as e:
+        logger.exception("debug/db failed")
+        return JSONResponse({"db": "error", "detail": str(e)}, status_code=500)
+    finally:
         if conn:
             close_conn(conn)
-        return JSONResponse({"db": "error", "detail": str(e)}, status_code=500)
 
 
 @app.get("/debug/storage")
@@ -319,40 +367,58 @@ def debug_storage():
     }
 
 
-# ---------------- Auth middleware ----------------
-def _extract_api_key(request: Request):
-    hdr = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
-    if hdr:
-        return hdr
-    auth = request.headers.get("authorization")
-    if auth and auth.lower().startswith("bearer "):
-        return auth.split(" ", 1)[1].strip()
-    qp = request.query_params.get("key")
-    return qp
-
-
-OPEN_PATH_PREFIXES = ("/uploads", "/docs", "/openapi.json", "/redoc")
-OPEN_PATHS_EXACT = {"/", "/health", "/debug/auth", "/debug/db", "/debug/storage"}
-
-
-@app.middleware("http")
-async def require_key(request: Request, call_next):
-    path = request.url.path
-    if (path in OPEN_PATHS_EXACT) or any(path.startswith(p) for p in OPEN_PATH_PREFIXES):
-        return await call_next(request)
+@app.get("/debug/runtime")
+def debug_runtime(request: Request):
     if _extract_api_key(request) != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    return await call_next(request)
+    return {
+        "version": app.version,
+        "build": BUILD_STAMP,
+        "db_url_mask": _mask(DATABASE_URL),
+        "python": os.sys.version,
+        "google_available": _GOOGLE_AVAILABLE,
+    }
 
+
+@app.get("/debug/staff-probe")
+def debug_staff_probe(request: Request):
+    if _extract_api_key(request) != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    conn = None
+    cur = None
+    try:
+        conn = db()
+        cur = conn.cursor()
+
+        # confirm schema + columns
+        cur.execute("""
+            select column_name, data_type, is_nullable
+            from information_schema.columns
+            where table_schema='public' and table_name='staff'
+            order by ordinal_position;
+        """)
+        cols = rows_to_dicts(cur)
+
+        cur.execute("select * from public.staff limit 1;")
+        row = cur.fetchone()
+
+        return {"ok": True, "columns": cols, "sample_row": row}
+    except Exception as e:
+        logger.exception("staff probe failed")
+        return JSONResponse({"ok": False, "detail": f"{type(e).__name__}: {e}"}, status_code=500)
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            close_conn(conn)
 
 # ---------------- Data models ----------------
 class ProjectUpsert(BaseModel):
-    # API compatibility fields
     number: str
     name: Optional[str] = None
     status: Optional[str] = None
 
-    # Neon columns (optional)
     client_id: Optional[int] = None
     start_year: Optional[int] = None
     completion_year: Optional[int] = None
@@ -380,14 +446,12 @@ class StaffUpsert(BaseModel):
     role: Optional[str] = None
     email: Optional[str] = None
     phone_number: Optional[str] = None
-    project_teams: Optional[str] = None  # stored as text/json string
 
 
 class FileImportBody(BaseModel):
     url: str
     filename: Optional[str] = None
     content_type: Optional[str] = None
-
 
 # ---------------- Helpers ----------------
 def _get_project_id(cur, number: str) -> Optional[int]:
@@ -399,14 +463,10 @@ def _get_project_id(cur, number: str) -> Optional[int]:
 # ---------------- Project Routes ----------------
 @app.get("/projects/search")
 def search_projects(text: str = ""):
-    """
-    Search projects by project_number or project_name.
-    Returns API keys: number/name/status but uses DB columns project_*.
-    """
     conn = db()
     cur = conn.cursor()
     try:
-        q = f"%{text}%"
+        q = f"%{text}%" if text else "%"
         cur.execute(
             """
             select
@@ -482,7 +542,6 @@ def get_project_by_id(pid: int):
         row = cur.fetchone()
         if not row:
             return JSONResponse({"error": "not_found"}, status_code=404)
-
         keys = [c[0] for c in cur.description]
         return dict(zip(keys, row))
     finally:
@@ -525,7 +584,6 @@ def get_project_by_number(number: str):
         row = cur.fetchone()
         if not row:
             return JSONResponse({"error": "not_found"}, status_code=404)
-
         keys = [c[0] for c in cur.description]
         return dict(zip(keys, row))
     except Exception as e:
@@ -683,7 +741,6 @@ def list_clients(limit: int = 200):
 def upsert_client_by_name(data: ClientUpsert, request: Request):
     if _extract_api_key(request) != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-
     conn = db()
     cur = conn.cursor()
     try:
@@ -710,10 +767,7 @@ def upsert_client_by_name(data: ClientUpsert, request: Request):
 
 # ---------------- Staff ----------------
 @app.get("/staff")
-def list_staff(limit: int = 500, request: Request = None):
-    if _extract_api_key(request) != API_KEY:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
+def list_staff(limit: int = 200):
     conn = db()
     cur = conn.cursor()
     try:
@@ -725,65 +779,66 @@ def list_staff(limit: int = 500, request: Request = None):
                 last_name,
                 role,
                 email,
-                phone_number,
-                project_teams
-            from staff
+                phone_number
+            from public.staff
             order by last_name asc, first_name asc
             limit %s
             """,
             (limit,),
         )
         return rows_to_dicts(cur)
+    except Exception as e:
+        logger.exception("staff list failed")
+        return JSONResponse(
+            {"error": "staff_list_failed", "detail": f"{type(e).__name__}: {e}"},
+            status_code=500,
+        )
     finally:
         cur.close()
         close_conn(conn)
 
 
-@app.post("/staff/upsert")
-def upsert_staff(data: StaffUpsert, request: Request):
-    """
-    Upsert staff by email if provided, else by (first_name,last_name).
-    This avoids needing a UNIQUE(name) constraint if you don't want one.
-    """
+@app.post("/staff/upsert-by-email")
+def upsert_staff_by_email(data: StaffUpsert, request: Request):
     if _extract_api_key(request) != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
     conn = db()
     cur = conn.cursor()
     try:
+        existing = None
         if data.email:
-            cur.execute("select id from staff where email=%s", (data.email,))
-        else:
-            cur.execute(
-                "select id from staff where first_name=%s and last_name=%s",
-                (data.first_name, data.last_name),
-            )
-        row = cur.fetchone()
+            cur.execute("select id from public.staff where email=%s", (data.email,))
+            existing = cur.fetchone()
 
-        if row:
-            sid = row[0]
-            sets, params = [], []
-            for field in ["first_name", "last_name", "role", "email", "phone_number", "project_teams"]:
-                val = getattr(data, field)
-                if val is not None:
-                    sets.append(f"{field}=%s")
-                    params.append(val)
-            params.append(sid)
-            cur.execute(f"update staff set {', '.join(sets)} where id=%s", tuple(params))
+        if existing:
+            sid = existing[0]
+            cur.execute(
+                """
+                update public.staff
+                set first_name=%s,
+                    last_name=%s,
+                    role=%s,
+                    email=%s,
+                    phone_number=%s
+                where id=%s
+                """,
+                (
+                    data.first_name,
+                    data.last_name,
+                    data.role,
+                    data.email,
+                    data.phone_number,
+                    sid,
+                ),
+            )
             conn.commit()
-            return {"ok": True, "id": sid, "first_name": data.first_name, "last_name": data.last_name}
+            return {"ok": True, "id": sid, "email": data.email}
 
         cur.execute(
             """
-            insert into staff (
-                first_name,
-                last_name,
-                role,
-                email,
-                phone_number,
-                project_teams
-            )
-            values (%s,%s,%s,%s,%s,%s)
+            insert into public.staff (first_name, last_name, role, email, phone_number)
+            values (%s,%s,%s,%s,%s)
             returning id
             """,
             (
@@ -792,17 +847,38 @@ def upsert_staff(data: StaffUpsert, request: Request):
                 data.role,
                 data.email,
                 data.phone_number,
-                data.project_teams,
             ),
         )
         sid = cur.fetchone()[0]
         conn.commit()
-        return {"ok": True, "id": sid, "first_name": data.first_name, "last_name": data.last_name}
+        return {"ok": True, "id": sid, "email": data.email}
 
     except Exception as e:
         conn.rollback()
-        logger.exception("staff/upsert failed")
-        return JSONResponse({"error": "staff_upsert_failed", "detail": str(e)}, status_code=500)
+        logger.exception("staff upsert failed")
+        return JSONResponse(
+            {"error": "staff_upsert_failed", "detail": f"{type(e).__name__}: {e}"},
+            status_code=500,
+        )
+    finally:
+        cur.close()
+        close_conn(conn)
+
+
+@app.delete("/staff/delete-by-id/{sid}")
+def delete_staff_by_id(sid: int, request: Request):
+    if _extract_api_key(request) != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("delete from public.staff where id=%s returning id", (sid,))
+        row = cur.fetchone()
+        conn.commit()
+        if not row:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        return {"ok": True, "deleted_staff_id": sid}
     finally:
         cur.close()
         close_conn(conn)
@@ -825,12 +901,12 @@ async def upload_project_file(
         if not pid:
             return JSONResponse({"error": "project_not_found"}, status_code=404)
 
-        data_bytes = await file.read()
+        data = await file.read()
         fname = file.filename or f"upload-{uuid.uuid4().hex}"
         mime = (file.content_type or _infer_mime(fname)).split(";")[0].strip()
 
         if storage_mode() == "drive":
-            meta = _drive_upload(fname, data_bytes, mime)
+            meta = _drive_upload(fname, data, mime)
             drive_id = meta["id"]
             cur.execute(
                 """
@@ -855,7 +931,7 @@ async def upload_project_file(
         safe_name = f"{number}_{uuid.uuid4().hex}{ext}"
         local_path = os.path.join("uploads", os.path.basename(safe_name))
         with open(local_path, "wb") as f:
-            f.write(data_bytes)
+            f.write(data)
 
         cur.execute(
             """
@@ -910,13 +986,7 @@ def import_file_from_url(number: str, data: FileImportBody, request: Request):
             }
         )
         resp = sess.get(data.url, stream=True, allow_redirects=True, timeout=(6, 30))
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError:
-            return JSONResponse(
-                {"error": "upstream_error", "detail": f"{resp.status_code} {resp.reason}", "url": data.url},
-                status_code=502,
-            )
+        resp.raise_for_status()
 
         fname = data.filename or os.path.basename(urlparse(data.url).path) or f"import-{uuid.uuid4().hex}"
         mime = (data.content_type or resp.headers.get("Content-Type") or _infer_mime(fname)).split(";")[0].strip()
@@ -1184,7 +1254,7 @@ def delete_project_file(number: str, file_id: int, request: Request):
         close_conn(conn)
 
 
-# ---------------- Debug: outbound HTTP probe (API key required) ----------------
+# ---------------- Debug: outbound HTTP probe ----------------
 @app.get("/debug/http-probe")
 def http_probe(url: str = Query(..., description="URL to probe via HEAD/GET with redirects")):
     try:
