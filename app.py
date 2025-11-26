@@ -4,7 +4,11 @@
 # - Staff DB table/columns aligned:
 #   public.staff(id, first_name, last_name, role, email, phone_number)
 # - NEW: public.project_team CRUD endpoints
-#   (id, project_number, staff_id, role_on_project)
+#   IMPORTANT: robust even if project_team has NO id column.
+#   Expected columns:
+#       project_number (text)
+#       staff_id (int)
+#       role_on_project (text, nullable)
 # - Drive/local auto-switch, uploads, list, download, delete, CRUD, images search.
 # - Debug endpoints to prove deploy + diagnose staff.
 
@@ -16,7 +20,7 @@ import mimetypes
 import pathlib
 import socket
 from urllib.parse import urlparse
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 import requests
 import psycopg2
@@ -453,15 +457,11 @@ class FileImportBody(BaseModel):
     content_type: Optional[str] = None
 
 
-# ---- NEW: Project Team models ----
+# ---- NEW: Project Team models (NO id required) ----
 class ProjectTeamUpsert(BaseModel):
     project_number: str
     staff_id: int
     role_on_project: Optional[str] = None
-
-
-class ProjectTeamRow(ProjectTeamUpsert):
-    id: int
 
 
 # ---------------- Helpers ----------------
@@ -904,6 +904,7 @@ def delete_staff_by_id(sid: int, request: Request):
 # ---------------- NEW: Project Team ----------------
 @app.get("/project-team")
 def list_project_team(
+    request: Request,
     project_number: Optional[str] = None,
     staff_id: Optional[int] = None,
     limit: int = 200,
@@ -914,86 +915,55 @@ def list_project_team(
       - project_number
       - staff_id
     """
+    if _extract_api_key(request) != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
     conn = db()
     cur = conn.cursor()
     try:
         where = []
-        params = []
+        params: List[Any] = []
 
         if project_number:
             where.append("project_number=%s")
             params.append(project_number)
 
-        if staff_id:
+        if staff_id is not None:
             where.append("staff_id=%s")
             params.append(staff_id)
 
         where_sql = f"where {' and '.join(where)}" if where else ""
         params.append(limit)
 
+        # NOTE: no "id" selected here, because your table may not have it.
         cur.execute(
             f"""
-            select id, project_number, staff_id, role_on_project
+            select project_number, staff_id, role_on_project
             from public.project_team
             {where_sql}
-            order by id desc
+            order by project_number asc, staff_id asc
             limit %s
             """,
             tuple(params),
         )
         return rows_to_dicts(cur)
+
     except Exception as e:
         logger.exception("project_team list failed")
-        return JSONResponse({"error": "project_team_list_failed", "detail": str(e)}, status_code=500)
-    finally:
-        cur.close()
-        close_conn(conn)
-
-
-@app.post("/project-team/add")
-def add_project_team_row(data: ProjectTeamUpsert, request: Request):
-    """
-    Add a staff member to project_team.
-    """
-    if _extract_api_key(request) != API_KEY:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    conn = db()
-    cur = conn.cursor()
-    try:
-        pid = _get_project_id(cur, data.project_number)
-        if not pid:
-            return JSONResponse({"error": "project_not_found"}, status_code=404)
-
-        sid = _get_staff_id(cur, data.staff_id)
-        if not sid:
-            return JSONResponse({"error": "staff_not_found"}, status_code=404)
-
-        cur.execute(
-            """
-            insert into public.project_team (project_number, staff_id, role_on_project)
-            values (%s, %s, %s)
-            returning id
-            """,
-            (data.project_number, data.staff_id, data.role_on_project),
+        return JSONResponse(
+            {"error": "project_team_list_failed", "detail": f"{type(e).__name__}: {e}"},
+            status_code=500,
         )
-        new_id = cur.fetchone()[0]
-        conn.commit()
-        return {"ok": True, "id": new_id}
-
-    except Exception as e:
-        conn.rollback()
-        logger.exception("project_team add failed")
-        return JSONResponse({"error": "project_team_add_failed", "detail": str(e)}, status_code=500)
     finally:
         cur.close()
         close_conn(conn)
 
 
 @app.post("/project-team/upsert")
-def upsert_project_team_row(data: ProjectTeamRow, request: Request):
+def upsert_project_team_row(data: ProjectTeamUpsert, request: Request):
     """
-    Update / replace a project_team row by id.
+    Insert or update a project_team row by (project_number, staff_id).
+    Works even without UNIQUE constraints.
     """
     if _extract_api_key(request) != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -1001,6 +971,7 @@ def upsert_project_team_row(data: ProjectTeamRow, request: Request):
     conn = db()
     cur = conn.cursor()
     try:
+        # validate project + staff exist
         pid = _get_project_id(cur, data.project_number)
         if not pid:
             return JSONResponse({"error": "project_not_found"}, status_code=404)
@@ -1009,38 +980,58 @@ def upsert_project_team_row(data: ProjectTeamRow, request: Request):
         if not sid:
             return JSONResponse({"error": "staff_not_found"}, status_code=404)
 
+        # check if row exists
         cur.execute(
             """
-            update public.project_team
-            set project_number=%s,
-                staff_id=%s,
-                role_on_project=%s
-            where id=%s
-            returning id
+            select 1
+            from public.project_team
+            where project_number=%s and staff_id=%s
             """,
-            (data.project_number, data.staff_id, data.role_on_project, data.id),
+            (data.project_number, data.staff_id),
         )
-        row = cur.fetchone()
+        exists = cur.fetchone() is not None
+
+        if exists:
+            cur.execute(
+                """
+                update public.project_team
+                set role_on_project=%s
+                where project_number=%s and staff_id=%s
+                """,
+                (data.role_on_project, data.project_number, data.staff_id),
+            )
+        else:
+            cur.execute(
+                """
+                insert into public.project_team (project_number, staff_id, role_on_project)
+                values (%s, %s, %s)
+                """,
+                (data.project_number, data.staff_id, data.role_on_project),
+            )
+
         conn.commit()
-
-        if not row:
-            return JSONResponse({"error": "not_found"}, status_code=404)
-
-        return {"ok": True, "id": data.id}
+        return {"ok": True, "project_number": data.project_number, "staff_id": data.staff_id}
 
     except Exception as e:
         conn.rollback()
         logger.exception("project_team upsert failed")
-        return JSONResponse({"error": "project_team_upsert_failed", "detail": str(e)}, status_code=500)
+        return JSONResponse(
+            {"error": "project_team_upsert_failed", "detail": f"{type(e).__name__}: {e}"},
+            status_code=500,
+        )
     finally:
         cur.close()
         close_conn(conn)
 
 
-@app.delete("/project-team/delete/{id}")
-def delete_project_team_row(id: int, request: Request):
+@app.delete("/project-team/delete")
+def delete_project_team_row(
+    request: Request,
+    project_number: str = Query(...),
+    staff_id: int = Query(...),
+):
     """
-    Delete a project_team row by id.
+    Delete a project_team row by (project_number, staff_id).
     """
     if _extract_api_key(request) != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -1049,8 +1040,12 @@ def delete_project_team_row(id: int, request: Request):
     cur = conn.cursor()
     try:
         cur.execute(
-            "delete from public.project_team where id=%s returning id",
-            (id,),
+            """
+            delete from public.project_team
+            where project_number=%s and staff_id=%s
+            returning project_number, staff_id
+            """,
+            (project_number, staff_id),
         )
         row = cur.fetchone()
         conn.commit()
@@ -1058,12 +1053,15 @@ def delete_project_team_row(id: int, request: Request):
         if not row:
             return JSONResponse({"error": "not_found"}, status_code=404)
 
-        return {"ok": True, "deleted_id": id}
+        return {"ok": True, "deleted_project_number": project_number, "deleted_staff_id": staff_id}
 
     except Exception as e:
         conn.rollback()
         logger.exception("project_team delete failed")
-        return JSONResponse({"error": "project_team_delete_failed", "detail": str(e)}, status_code=500)
+        return JSONResponse(
+            {"error": "project_team_delete_failed", "detail": f"{type(e).__name__}: {e}"},
+            status_code=500,
+        )
     finally:
         cur.close()
         close_conn(conn)
