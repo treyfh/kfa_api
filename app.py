@@ -1,16 +1,13 @@
 # app.py — DEEP+ API (projects, clients, staff, project_team, file storage with optional Google Drive)
-# Version 1.1.8 (project_team CRUD + minor hardening)
+# Version 1.1.9 (project_team schema fix: project_id/staff_id/role, no id)
 # - Projects DB columns aligned to user's Neon schema.
-# - Staff DB table/columns aligned:
-#   public.staff(id, first_name, last_name, role, email, phone_number)
-# - NEW: public.project_team CRUD endpoints
-#   IMPORTANT: robust even if project_team has NO id column.
-#   Expected columns:
-#       project_number (text)
-#       staff_id (int)
-#       role_on_project (text, nullable)
+# - Staff DB table/columns aligned: public.staff(id, first_name, last_name, role, email, phone_number)
+# - FIXED: public.project_team CRUD endpoints
+#   Neon schema: (project_id, staff_id, role)
+#   API accepts project_number -> resolves to project_id
+#   Upsert/delete by composite key (project_id, staff_id)
 # - Drive/local auto-switch, uploads, list, download, delete, CRUD, images search.
-# - Debug endpoints to prove deploy + diagnose staff.
+# - Debug endpoints to prove deploy + diagnose staff/project_team.
 
 import os
 import io
@@ -20,7 +17,7 @@ import mimetypes
 import pathlib
 import socket
 from urllib.parse import urlparse
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any
 
 import requests
 import psycopg2
@@ -50,8 +47,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 API_KEY = os.getenv("API_KEY", "dev")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# Give yourself a hard proof that THIS code is live
-BUILD_STAMP = os.getenv("BUILD_STAMP", "2025-11-26a")
+# Proof this code is live
+BUILD_STAMP = os.getenv("BUILD_STAMP", "2025-11-26b")
 
 # Google Drive config
 GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")
@@ -85,7 +82,7 @@ logger.info(
 )
 
 # ---------------- FastAPI ----------------
-app = FastAPI(title="DEEP+ API", version="1.1.8")
+app = FastAPI(title="DEEP+ API", version="1.1.9")
 
 app.add_middleware(
     CORSMiddleware,
@@ -416,6 +413,39 @@ def debug_staff_probe(request: Request):
         if conn:
             close_conn(conn)
 
+
+@app.get("/debug/project-team-probe")
+def debug_project_team_probe(request: Request):
+    if _extract_api_key(request) != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    conn = None
+    cur = None
+    try:
+        conn = db()
+        cur = conn.cursor()
+
+        cur.execute("""
+            select column_name, data_type, is_nullable
+            from information_schema.columns
+            where table_schema='public' and table_name='project_team'
+            order by ordinal_position;
+        """)
+        cols = rows_to_dicts(cur)
+
+        cur.execute("select * from public.project_team limit 5;")
+        sample = rows_to_dicts(cur)
+
+        return {"ok": True, "columns": cols, "sample_rows": sample}
+    except Exception as e:
+        logger.exception("project_team probe failed")
+        return JSONResponse({"ok": False, "detail": f"{type(e).__name__}: {e}"}, status_code=500)
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            close_conn(conn)
+
 # ---------------- Data models ----------------
 class ProjectUpsert(BaseModel):
     number: str
@@ -457,11 +487,16 @@ class FileImportBody(BaseModel):
     content_type: Optional[str] = None
 
 
-# ---- NEW: Project Team models (NO id required) ----
+# ---- Project Team models fixed to Neon schema ----
 class ProjectTeamUpsert(BaseModel):
+    project_number: str          # chatbot-friendly -> resolved to project_id
+    staff_id: int
+    role: Optional[str] = None   # maps to public.project_team.role
+
+
+class ProjectTeamDelete(BaseModel):
     project_number: str
     staff_id: int
-    role_on_project: Optional[str] = None
 
 
 # ---------------- Helpers ----------------
@@ -901,10 +936,9 @@ def delete_staff_by_id(sid: int, request: Request):
         close_conn(conn)
 
 
-# ---------------- NEW: Project Team ----------------
+# ---------------- FIXED: Project Team (Neon schema: project_id, staff_id, role) ----------------
 @app.get("/project-team")
 def list_project_team(
-    request: Request,
     project_number: Optional[str] = None,
     staff_id: Optional[int] = None,
     limit: int = 200,
@@ -912,48 +946,49 @@ def list_project_team(
     """
     List project_team rows.
     Optional filters:
-      - project_number
+      - project_number (resolved to project_id)
       - staff_id
+    Returns project_number for convenience via join.
     """
-    if _extract_api_key(request) != API_KEY:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
     conn = db()
     cur = conn.cursor()
     try:
         where = []
-        params: List[Any] = []
+        params = []
 
         if project_number:
-            where.append("project_number=%s")
-            params.append(project_number)
+            pid = _get_project_id(cur, project_number)
+            if not pid:
+                return []  # no such project
+            where.append("pt.project_id=%s")
+            params.append(pid)
 
         if staff_id is not None:
-            where.append("staff_id=%s")
+            where.append("pt.staff_id=%s")
             params.append(staff_id)
 
         where_sql = f"where {' and '.join(where)}" if where else ""
         params.append(limit)
 
-        # NOTE: no "id" selected here, because your table may not have it.
         cur.execute(
             f"""
-            select project_number, staff_id, role_on_project
-            from public.project_team
+            select
+                pt.project_id,
+                p.project_number,
+                pt.staff_id,
+                pt.role
+            from public.project_team pt
+            join projects p on p.id = pt.project_id
             {where_sql}
-            order by project_number asc, staff_id asc
+            order by p.project_number asc, pt.staff_id asc
             limit %s
             """,
             tuple(params),
         )
         return rows_to_dicts(cur)
-
     except Exception as e:
         logger.exception("project_team list failed")
-        return JSONResponse(
-            {"error": "project_team_list_failed", "detail": f"{type(e).__name__}: {e}"},
-            status_code=500,
-        )
+        return JSONResponse({"error": "project_team_list_failed", "detail": str(e)}, status_code=500)
     finally:
         cur.close()
         close_conn(conn)
@@ -962,8 +997,8 @@ def list_project_team(
 @app.post("/project-team/upsert")
 def upsert_project_team_row(data: ProjectTeamUpsert, request: Request):
     """
-    Insert or update a project_team row by (project_number, staff_id).
-    Works even without UNIQUE constraints.
+    Add or update a staff member on a project.
+    Uses composite key (project_id, staff_id).
     """
     if _extract_api_key(request) != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -971,7 +1006,6 @@ def upsert_project_team_row(data: ProjectTeamUpsert, request: Request):
     conn = db()
     cur = conn.cursor()
     try:
-        # validate project + staff exist
         pid = _get_project_id(cur, data.project_number)
         if not pid:
             return JSONResponse({"error": "project_not_found"}, status_code=404)
@@ -980,14 +1014,13 @@ def upsert_project_team_row(data: ProjectTeamUpsert, request: Request):
         if not sid:
             return JSONResponse({"error": "staff_not_found"}, status_code=404)
 
-        # check if row exists
+        # manual upsert to avoid relying on a unique constraint
         cur.execute(
             """
-            select 1
-            from public.project_team
-            where project_number=%s and staff_id=%s
+            select 1 from public.project_team
+            where project_id=%s and staff_id=%s
             """,
-            (data.project_number, data.staff_id),
+            (pid, data.staff_id),
         )
         exists = cur.fetchone() is not None
 
@@ -995,43 +1028,36 @@ def upsert_project_team_row(data: ProjectTeamUpsert, request: Request):
             cur.execute(
                 """
                 update public.project_team
-                set role_on_project=%s
-                where project_number=%s and staff_id=%s
+                set role=%s
+                where project_id=%s and staff_id=%s
                 """,
-                (data.role_on_project, data.project_number, data.staff_id),
+                (data.role, pid, data.staff_id),
             )
         else:
             cur.execute(
                 """
-                insert into public.project_team (project_number, staff_id, role_on_project)
+                insert into public.project_team (project_id, staff_id, role)
                 values (%s, %s, %s)
                 """,
-                (data.project_number, data.staff_id, data.role_on_project),
+                (pid, data.staff_id, data.role),
             )
 
         conn.commit()
-        return {"ok": True, "project_number": data.project_number, "staff_id": data.staff_id}
+        return {"ok": True, "project_id": pid, "project_number": data.project_number, "staff_id": data.staff_id}
 
     except Exception as e:
         conn.rollback()
         logger.exception("project_team upsert failed")
-        return JSONResponse(
-            {"error": "project_team_upsert_failed", "detail": f"{type(e).__name__}: {e}"},
-            status_code=500,
-        )
+        return JSONResponse({"error": "project_team_upsert_failed", "detail": str(e)}, status_code=500)
     finally:
         cur.close()
         close_conn(conn)
 
 
-@app.delete("/project-team/delete")
-def delete_project_team_row(
-    request: Request,
-    project_number: str = Query(...),
-    staff_id: int = Query(...),
-):
+@app.delete("/project-team/{project_number}/{staff_id}")
+def delete_project_team_row(project_number: str, staff_id: int, request: Request):
     """
-    Delete a project_team row by (project_number, staff_id).
+    Delete a project_team link by (project_number, staff_id).
     """
     if _extract_api_key(request) != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -1039,13 +1065,17 @@ def delete_project_team_row(
     conn = db()
     cur = conn.cursor()
     try:
+        pid = _get_project_id(cur, project_number)
+        if not pid:
+            return JSONResponse({"error": "project_not_found"}, status_code=404)
+
         cur.execute(
             """
             delete from public.project_team
-            where project_number=%s and staff_id=%s
-            returning project_number, staff_id
+            where project_id=%s and staff_id=%s
+            returning staff_id
             """,
-            (project_number, staff_id),
+            (pid, staff_id),
         )
         row = cur.fetchone()
         conn.commit()
@@ -1053,15 +1083,12 @@ def delete_project_team_row(
         if not row:
             return JSONResponse({"error": "not_found"}, status_code=404)
 
-        return {"ok": True, "deleted_project_number": project_number, "deleted_staff_id": staff_id}
+        return {"ok": True, "project_number": project_number, "staff_id": staff_id}
 
     except Exception as e:
         conn.rollback()
         logger.exception("project_team delete failed")
-        return JSONResponse(
-            {"error": "project_team_delete_failed", "detail": f"{type(e).__name__}: {e}"},
-            status_code=500,
-        )
+        return JSONResponse({"error": "project_team_delete_failed", "detail": str(e)}, status_code=500)
     finally:
         cur.close()
         close_conn(conn)
@@ -1497,3 +1524,4 @@ def http_probe(url: str = Query(..., description="URL to probe via HEAD/GET with
         }
     except Exception as e:
         return JSONResponse({"error": "probe_failed", "detail": str(e)}, status_code=500)
+
