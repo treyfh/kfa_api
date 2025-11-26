@@ -1,8 +1,10 @@
-# app.py — DEEP+ API (projects, clients, staff, file storage with optional Google Drive)
-# Version 1.1.7 (deploy stamp + DB hardening + better staff diagnostics)
+# app.py — DEEP+ API (projects, clients, staff, project_team, file storage with optional Google Drive)
+# Version 1.1.8 (project_team CRUD + minor hardening)
 # - Projects DB columns aligned to user's Neon schema.
 # - Staff DB table/columns aligned:
 #   public.staff(id, first_name, last_name, role, email, phone_number)
+# - NEW: public.project_team CRUD endpoints
+#   (id, project_number, staff_id, role_on_project)
 # - Drive/local auto-switch, uploads, list, download, delete, CRUD, images search.
 # - Debug endpoints to prove deploy + diagnose staff.
 
@@ -45,7 +47,7 @@ API_KEY = os.getenv("API_KEY", "dev")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # Give yourself a hard proof that THIS code is live
-BUILD_STAMP = os.getenv("BUILD_STAMP", "2025-11-25b")
+BUILD_STAMP = os.getenv("BUILD_STAMP", "2025-11-26a")
 
 # Google Drive config
 GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")
@@ -79,7 +81,7 @@ logger.info(
 )
 
 # ---------------- FastAPI ----------------
-app = FastAPI(title="DEEP+ API", version="1.1.7")
+app = FastAPI(title="DEEP+ API", version="1.1.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -134,7 +136,7 @@ def _startup():
         _ensure_database_url()
         _POOL = SimpleConnectionPool(minconn=1, maxconn=5, dsn=DATABASE_URL)
         logger.info("DB connection pool initialized")
-    except Exception as e:
+    except Exception:
         _POOL = None
         logger.exception("DB pool init failed")
 
@@ -160,7 +162,6 @@ def db():
 
     conn = _POOL.getconn()
     try:
-        # quick liveness check
         cur = conn.cursor()
         cur.execute("SELECT 1")
         cur.close()
@@ -174,7 +175,6 @@ def db():
             _POOL.putconn(conn, close=True)
         except Exception:
             pass
-        # retry once with a fresh conn
         conn2 = _POOL.getconn()
         return conn2
 
@@ -391,7 +391,6 @@ def debug_staff_probe(request: Request):
         conn = db()
         cur = conn.cursor()
 
-        # confirm schema + columns
         cur.execute("""
             select column_name, data_type, is_nullable
             from information_schema.columns
@@ -453,9 +452,27 @@ class FileImportBody(BaseModel):
     filename: Optional[str] = None
     content_type: Optional[str] = None
 
+
+# ---- NEW: Project Team models ----
+class ProjectTeamUpsert(BaseModel):
+    project_number: str
+    staff_id: int
+    role_on_project: Optional[str] = None
+
+
+class ProjectTeamRow(ProjectTeamUpsert):
+    id: int
+
+
 # ---------------- Helpers ----------------
 def _get_project_id(cur, number: str) -> Optional[int]:
     cur.execute("select id from projects where project_number=%s", (number,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _get_staff_id(cur, staff_id: int) -> Optional[int]:
+    cur.execute("select id from public.staff where id=%s", (staff_id,))
     row = cur.fetchone()
     return row[0] if row else None
 
@@ -884,6 +901,174 @@ def delete_staff_by_id(sid: int, request: Request):
         close_conn(conn)
 
 
+# ---------------- NEW: Project Team ----------------
+@app.get("/project-team")
+def list_project_team(
+    project_number: Optional[str] = None,
+    staff_id: Optional[int] = None,
+    limit: int = 200,
+):
+    """
+    List project_team rows.
+    Optional filters:
+      - project_number
+      - staff_id
+    """
+    conn = db()
+    cur = conn.cursor()
+    try:
+        where = []
+        params = []
+
+        if project_number:
+            where.append("project_number=%s")
+            params.append(project_number)
+
+        if staff_id:
+            where.append("staff_id=%s")
+            params.append(staff_id)
+
+        where_sql = f"where {' and '.join(where)}" if where else ""
+        params.append(limit)
+
+        cur.execute(
+            f"""
+            select id, project_number, staff_id, role_on_project
+            from public.project_team
+            {where_sql}
+            order by id desc
+            limit %s
+            """,
+            tuple(params),
+        )
+        return rows_to_dicts(cur)
+    except Exception as e:
+        logger.exception("project_team list failed")
+        return JSONResponse({"error": "project_team_list_failed", "detail": str(e)}, status_code=500)
+    finally:
+        cur.close()
+        close_conn(conn)
+
+
+@app.post("/project-team/add")
+def add_project_team_row(data: ProjectTeamUpsert, request: Request):
+    """
+    Add a staff member to project_team.
+    """
+    if _extract_api_key(request) != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    conn = db()
+    cur = conn.cursor()
+    try:
+        pid = _get_project_id(cur, data.project_number)
+        if not pid:
+            return JSONResponse({"error": "project_not_found"}, status_code=404)
+
+        sid = _get_staff_id(cur, data.staff_id)
+        if not sid:
+            return JSONResponse({"error": "staff_not_found"}, status_code=404)
+
+        cur.execute(
+            """
+            insert into public.project_team (project_number, staff_id, role_on_project)
+            values (%s, %s, %s)
+            returning id
+            """,
+            (data.project_number, data.staff_id, data.role_on_project),
+        )
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        return {"ok": True, "id": new_id}
+
+    except Exception as e:
+        conn.rollback()
+        logger.exception("project_team add failed")
+        return JSONResponse({"error": "project_team_add_failed", "detail": str(e)}, status_code=500)
+    finally:
+        cur.close()
+        close_conn(conn)
+
+
+@app.post("/project-team/upsert")
+def upsert_project_team_row(data: ProjectTeamRow, request: Request):
+    """
+    Update / replace a project_team row by id.
+    """
+    if _extract_api_key(request) != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    conn = db()
+    cur = conn.cursor()
+    try:
+        pid = _get_project_id(cur, data.project_number)
+        if not pid:
+            return JSONResponse({"error": "project_not_found"}, status_code=404)
+
+        sid = _get_staff_id(cur, data.staff_id)
+        if not sid:
+            return JSONResponse({"error": "staff_not_found"}, status_code=404)
+
+        cur.execute(
+            """
+            update public.project_team
+            set project_number=%s,
+                staff_id=%s,
+                role_on_project=%s
+            where id=%s
+            returning id
+            """,
+            (data.project_number, data.staff_id, data.role_on_project, data.id),
+        )
+        row = cur.fetchone()
+        conn.commit()
+
+        if not row:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+
+        return {"ok": True, "id": data.id}
+
+    except Exception as e:
+        conn.rollback()
+        logger.exception("project_team upsert failed")
+        return JSONResponse({"error": "project_team_upsert_failed", "detail": str(e)}, status_code=500)
+    finally:
+        cur.close()
+        close_conn(conn)
+
+
+@app.delete("/project-team/delete/{id}")
+def delete_project_team_row(id: int, request: Request):
+    """
+    Delete a project_team row by id.
+    """
+    if _extract_api_key(request) != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "delete from public.project_team where id=%s returning id",
+            (id,),
+        )
+        row = cur.fetchone()
+        conn.commit()
+
+        if not row:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+
+        return {"ok": True, "deleted_id": id}
+
+    except Exception as e:
+        conn.rollback()
+        logger.exception("project_team delete failed")
+        return JSONResponse({"error": "project_team_delete_failed", "detail": str(e)}, status_code=500)
+    finally:
+        cur.close()
+        close_conn(conn)
+
+
 # ---------------- File upload ----------------
 @app.post("/projects/{number}/files")
 async def upload_project_file(
@@ -901,12 +1086,12 @@ async def upload_project_file(
         if not pid:
             return JSONResponse({"error": "project_not_found"}, status_code=404)
 
-        data = await file.read()
+        data_bytes = await file.read()
         fname = file.filename or f"upload-{uuid.uuid4().hex}"
         mime = (file.content_type or _infer_mime(fname)).split(";")[0].strip()
 
         if storage_mode() == "drive":
-            meta = _drive_upload(fname, data, mime)
+            meta = _drive_upload(fname, data_bytes, mime)
             drive_id = meta["id"]
             cur.execute(
                 """
@@ -931,7 +1116,7 @@ async def upload_project_file(
         safe_name = f"{number}_{uuid.uuid4().hex}{ext}"
         local_path = os.path.join("uploads", os.path.basename(safe_name))
         with open(local_path, "wb") as f:
-            f.write(data)
+            f.write(data_bytes)
 
         cur.execute(
             """
