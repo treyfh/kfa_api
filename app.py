@@ -1,12 +1,18 @@
 # app.py — DEEP+ API (projects, clients, staff, project_team, file storage with optional Google Drive)
-# Version 1.1.9 (project_team schema fix: project_id/staff_id/role, no id)
-# - Projects DB columns aligned to user's Neon schema.
-# - Staff DB table/columns aligned: public.staff(id, first_name, last_name, role, email, phone_number)
-# - FIXED: public.project_team CRUD endpoints
-#   Neon schema: (project_id, staff_id, role)
-#   API accepts project_number -> resolves to project_id
-#   Upsert/delete by composite key (project_id, staff_id)
-# - Drive/local auto-switch, uploads, list, download, delete, CRUD, images search.
+# Version 1.2.0 (Project Team flexible project lookup + quality-of-life for firm ops)
+#
+# Key upgrades:
+# - project_team: Neon schema confirmed (project_id, staff_id, role)
+#   API now accepts ANY project identifier:
+#     * project_id OR project_number OR project_name
+#   Upsert/delete by composite key (project_id, staff_id).
+# - Better chatbot ergonomics:
+#   * /projects/by-name/{name}  (resolve exact/fuzzy)
+#   * /projects/{identifier}/team  (list team by number/id/name)
+#   * /staff/search  (search by name/email/role)
+#   * /projects/search returns richer results + safer limit
+# - Minor hardening (input trims, limit clamps, stable ordering).
+# - Drive/local auto-switch, uploads, list, download, delete, images search.
 # - Debug endpoints to prove deploy + diagnose staff/project_team.
 
 import os
@@ -17,18 +23,18 @@ import mimetypes
 import pathlib
 import socket
 from urllib.parse import urlparse
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List, Union
 
 import requests
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2 import OperationalError, InterfaceError
 
-from fastapi import FastAPI, Request, File, UploadFile, Query
+from fastapi import FastAPI, Request, File, UploadFile, Query, Path
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 # --- Optional Google Drive imports (guarded) ---
@@ -48,7 +54,7 @@ API_KEY = os.getenv("API_KEY", "dev")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # Proof this code is live
-BUILD_STAMP = os.getenv("BUILD_STAMP", "2025-11-26b")
+BUILD_STAMP = os.getenv("BUILD_STAMP", "2025-11-27a")
 
 # Google Drive config
 GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")
@@ -82,7 +88,7 @@ logger.info(
 )
 
 # ---------------- FastAPI ----------------
-app = FastAPI(title="DEEP+ API", version="1.1.9")
+app = FastAPI(title="DEEP+ API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -202,6 +208,16 @@ def close_conn(conn):
 def rows_to_dicts(cur):
     cols = [c[0] for c in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def _clamp_limit(limit: int, default: int = 200, max_limit: int = 1000) -> int:
+    if limit is None:
+        return default
+    try:
+        limit = int(limit)
+    except Exception:
+        return default
+    return max(1, min(limit, max_limit))
 
 # ---------------- Storage Mode & Drive Helpers ----------------
 _drive_svc = None
@@ -487,15 +503,19 @@ class FileImportBody(BaseModel):
     content_type: Optional[str] = None
 
 
-# ---- Project Team models fixed to Neon schema ----
+# ---- UPDATED Project Team models (accept id OR number OR name) ----
 class ProjectTeamUpsert(BaseModel):
-    project_number: str          # chatbot-friendly -> resolved to project_id
+    project_id: Optional[int] = None
+    project_number: Optional[str] = None
+    project_name: Optional[str] = None
     staff_id: int
-    role: Optional[str] = None   # maps to public.project_team.role
+    role: Optional[str] = None
 
 
 class ProjectTeamDelete(BaseModel):
-    project_number: str
+    project_id: Optional[int] = None
+    project_number: Optional[str] = None
+    project_name: Optional[str] = None
     staff_id: int
 
 
@@ -512,13 +532,75 @@ def _get_staff_id(cur, staff_id: int) -> Optional[int]:
     return row[0] if row else None
 
 
+def _resolve_project_id(
+    cur,
+    *,
+    project_id: Optional[int] = None,
+    project_number: Optional[str] = None,
+    project_name: Optional[str] = None,
+) -> Optional[int]:
+    """
+    Resolve a project_id from any of:
+      - project_id (direct)
+      - project_number (exact)
+      - project_name (case-insensitive exact, then fuzzy ilike)
+    """
+    if project_id is not None:
+        cur.execute("select id from projects where id=%s", (project_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    if project_number:
+        cur.execute("select id from projects where project_number=%s", (project_number.strip(),))
+        row = cur.fetchone()
+        if row:
+            return row[0]
+
+    if project_name:
+        pn = project_name.strip()
+        cur.execute(
+            "select id from projects where lower(coalesce(project_name,'')) = lower(%s) limit 1",
+            (pn,),
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+
+        cur.execute(
+            "select id from projects where coalesce(project_name,'') ilike %s order by id asc limit 1",
+            (pn,),
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+
+    return None
+
+
+def _project_identifier_from_path(identifier: str) -> Dict[str, Any]:
+    """
+    Interpret /projects/{identifier}/team style path:
+    - numeric => project_id
+    - else => project_number first, and allow name fallback
+    """
+    ident = (identifier or "").strip()
+    if ident.isdigit():
+        return {"project_id": int(ident)}
+    return {"project_number": ident, "project_name": ident}
+
 # ---------------- Project Routes ----------------
 @app.get("/projects/search")
-def search_projects(text: str = ""):
+def search_projects(
+    text: str = Query("", description="Search by project number or name"),
+    limit: int = Query(50, ge=1, le=200),
+):
     conn = db()
     cur = conn.cursor()
     try:
+        text = (text or "").strip()
         q = f"%{text}%" if text else "%"
+        limit = _clamp_limit(limit, default=50, max_limit=200)
+
         cur.execute(
             """
             select
@@ -545,10 +627,10 @@ def search_projects(text: str = ""):
             where
                 project_number ilike %s
                 or coalesce(project_name, '') ilike %s
-            order by project_number asc
-            limit 50
+            order by project_number asc nulls last, id asc
+            limit %s
             """,
-            (q, q),
+            (q, q, limit),
         )
         return rows_to_dicts(cur)
     except Exception as e:
@@ -606,6 +688,7 @@ def get_project_by_number(number: str):
     conn = db()
     cur = conn.cursor()
     try:
+        number = (number or "").strip()
         cur.execute(
             """
             select
@@ -646,6 +729,86 @@ def get_project_by_number(number: str):
         close_conn(conn)
 
 
+# NEW: chatbot-friendly by-name lookup
+@app.get("/projects/by-name/{name}")
+def get_project_by_name(name: str):
+    conn = db()
+    cur = conn.cursor()
+    try:
+        name = (name or "").strip()
+        # exact case-insensitive
+        cur.execute(
+            """
+            select
+                id,
+                project_number as number,
+                project_name as name,
+                project_status as status,
+                client_id,
+                start_year,
+                completion_year,
+                country,
+                address,
+                project_type,
+                project_context,
+                project_description,
+                project_height_m,
+                gross_floor_area_m2,
+                number_of_stories,
+                residential_units,
+                commercial_units,
+                bicycle_parking,
+                vehicular_parking
+            from projects
+            where lower(coalesce(project_name,'')) = lower(%s)
+            limit 1
+            """,
+            (name,),
+        )
+        row = cur.fetchone()
+        if not row:
+            # fuzzy fallback
+            cur.execute(
+                """
+                select
+                    id,
+                    project_number as number,
+                    project_name as name,
+                    project_status as status,
+                    client_id,
+                    start_year,
+                    completion_year,
+                    country,
+                    address,
+                    project_type,
+                    project_context,
+                    project_description,
+                    project_height_m,
+                    gross_floor_area_m2,
+                    number_of_stories,
+                    residential_units,
+                    commercial_units,
+                    bicycle_parking,
+                    vehicular_parking
+                from projects
+                where coalesce(project_name,'') ilike %s
+                order by id asc
+                limit 1
+                """,
+                (name,),
+            )
+            row = cur.fetchone()
+
+        if not row:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+
+        keys = [c[0] for c in cur.description]
+        return dict(zip(keys, row))
+    finally:
+        cur.close()
+        close_conn(conn)
+
+
 @app.post("/projects/upsert-by-number")
 def upsert_project_by_number(data: ProjectUpsert, request: Request):
     if _extract_api_key(request) != API_KEY:
@@ -654,6 +817,12 @@ def upsert_project_by_number(data: ProjectUpsert, request: Request):
     conn = db()
     cur = conn.cursor()
     try:
+        data.number = data.number.strip()
+        if data.name is not None:
+            data.name = data.name.strip()
+        if data.status is not None:
+            data.status = data.status.strip()
+
         cur.execute("select id from projects where project_number=%s", (data.number,))
         row = cur.fetchone()
 
@@ -765,6 +934,7 @@ def delete_project_by_number(number: str, request: Request):
     conn = db()
     cur = conn.cursor()
     try:
+        number = (number or "").strip()
         cur.execute("delete from projects where project_number=%s returning id", (number,))
         row = cur.fetchone()
         conn.commit()
@@ -782,6 +952,7 @@ def list_clients(limit: int = 200):
     conn = db()
     cur = conn.cursor()
     try:
+        limit = _clamp_limit(limit, default=200, max_limit=1000)
         cur.execute("select id, name from clients order by name asc limit %s", (limit,))
         return rows_to_dicts(cur)
     finally:
@@ -796,6 +967,7 @@ def upsert_client_by_name(data: ClientUpsert, request: Request):
     conn = db()
     cur = conn.cursor()
     try:
+        data.name = data.name.strip()
         cur.execute(
             """
             insert into clients (name)
@@ -823,6 +995,7 @@ def list_staff(limit: int = 200):
     conn = db()
     cur = conn.cursor()
     try:
+        limit = _clamp_limit(limit, default=200, max_limit=1000)
         cur.execute(
             """
             select
@@ -833,7 +1006,7 @@ def list_staff(limit: int = 200):
                 email,
                 phone_number
             from public.staff
-            order by last_name asc, first_name asc
+            order by last_name asc nulls last, first_name asc nulls last, id asc
             limit %s
             """,
             (limit,),
@@ -850,6 +1023,40 @@ def list_staff(limit: int = 200):
         close_conn(conn)
 
 
+# NEW: staff search for chatbot & ops
+@app.get("/staff/search")
+def search_staff(
+    text: str = Query("", description="Search by first name, last name, email, or role"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    conn = db()
+    cur = conn.cursor()
+    try:
+        text = (text or "").strip()
+        q = f"%{text}%" if text else "%"
+        limit = _clamp_limit(limit, default=50, max_limit=200)
+
+        cur.execute(
+            """
+            select
+                id, first_name, last_name, role, email, phone_number
+            from public.staff
+            where
+                first_name ilike %s
+                or last_name ilike %s
+                or coalesce(email,'') ilike %s
+                or coalesce(role,'') ilike %s
+            order by last_name asc nulls last, first_name asc nulls last
+            limit %s
+            """,
+            (q, q, q, q, limit),
+        )
+        return rows_to_dicts(cur)
+    finally:
+        cur.close()
+        close_conn(conn)
+
+
 @app.post("/staff/upsert-by-email")
 def upsert_staff_by_email(data: StaffUpsert, request: Request):
     if _extract_api_key(request) != API_KEY:
@@ -858,6 +1065,16 @@ def upsert_staff_by_email(data: StaffUpsert, request: Request):
     conn = db()
     cur = conn.cursor()
     try:
+        # normalize strings
+        data.first_name = data.first_name.strip()
+        data.last_name = data.last_name.strip()
+        if data.role is not None:
+            data.role = data.role.strip()
+        if data.email is not None:
+            data.email = data.email.strip()
+        if data.phone_number is not None:
+            data.phone_number = data.phone_number.strip()
+
         existing = None
         if data.email:
             cur.execute("select id from public.staff where email=%s", (data.email,))
@@ -936,19 +1153,21 @@ def delete_staff_by_id(sid: int, request: Request):
         close_conn(conn)
 
 
-# ---------------- FIXED: Project Team (Neon schema: project_id, staff_id, role) ----------------
+# ---------------- Project Team (Neon schema: project_id, staff_id, role) ----------------
 @app.get("/project-team")
 def list_project_team(
     project_number: Optional[str] = None,
+    project_id: Optional[int] = None,
+    project_name: Optional[str] = None,
     staff_id: Optional[int] = None,
     limit: int = 200,
 ):
     """
     List project_team rows.
     Optional filters:
-      - project_number (resolved to project_id)
+      - project_id OR project_number OR project_name
       - staff_id
-    Returns project_number for convenience via join.
+    Returns project_number/project_name for convenience via join.
     """
     conn = db()
     cur = conn.cursor()
@@ -956,10 +1175,15 @@ def list_project_team(
         where = []
         params = []
 
-        if project_number:
-            pid = _get_project_id(cur, project_number)
+        if project_id or project_number or project_name:
+            pid = _resolve_project_id(
+                cur,
+                project_id=project_id,
+                project_number=project_number,
+                project_name=project_name,
+            )
             if not pid:
-                return []  # no such project
+                return []
             where.append("pt.project_id=%s")
             params.append(pid)
 
@@ -968,6 +1192,7 @@ def list_project_team(
             params.append(staff_id)
 
         where_sql = f"where {' and '.join(where)}" if where else ""
+        limit = _clamp_limit(limit, default=200, max_limit=1000)
         params.append(limit)
 
         cur.execute(
@@ -975,12 +1200,17 @@ def list_project_team(
             select
                 pt.project_id,
                 p.project_number,
+                p.project_name,
                 pt.staff_id,
-                pt.role
+                s.first_name,
+                s.last_name,
+                s.role as staff_role,
+                pt.role as role_on_project
             from public.project_team pt
             join projects p on p.id = pt.project_id
+            join public.staff s on s.id = pt.staff_id
             {where_sql}
-            order by p.project_number asc, pt.staff_id asc
+            order by p.project_number asc nulls last, s.last_name asc nulls last, s.first_name asc nulls last
             limit %s
             """,
             tuple(params),
@@ -999,20 +1229,35 @@ def upsert_project_team_row(data: ProjectTeamUpsert, request: Request):
     """
     Add or update a staff member on a project.
     Uses composite key (project_id, staff_id).
+    Accepts project_id OR project_number OR project_name.
     """
     if _extract_api_key(request) != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
+    if not (data.project_id or data.project_number or data.project_name):
+        return JSONResponse(
+            {"error": "missing_project_identifier", "detail": "Provide project_id, project_number, or project_name"},
+            status_code=400,
+        )
+
     conn = db()
     cur = conn.cursor()
     try:
-        pid = _get_project_id(cur, data.project_number)
+        pid = _resolve_project_id(
+            cur,
+            project_id=data.project_id,
+            project_number=data.project_number,
+            project_name=data.project_name,
+        )
         if not pid:
             return JSONResponse({"error": "project_not_found"}, status_code=404)
 
         sid = _get_staff_id(cur, data.staff_id)
         if not sid:
             return JSONResponse({"error": "staff_not_found"}, status_code=404)
+
+        if data.role is not None:
+            data.role = data.role.strip()
 
         # manual upsert to avoid relying on a unique constraint
         cur.execute(
@@ -1043,7 +1288,14 @@ def upsert_project_team_row(data: ProjectTeamUpsert, request: Request):
             )
 
         conn.commit()
-        return {"ok": True, "project_id": pid, "project_number": data.project_number, "staff_id": data.staff_id}
+        return {
+            "ok": True,
+            "project_id": pid,
+            "project_number": data.project_number,
+            "project_name": data.project_name,
+            "staff_id": data.staff_id,
+            "role": data.role,
+        }
 
     except Exception as e:
         conn.rollback()
@@ -1054,10 +1306,18 @@ def upsert_project_team_row(data: ProjectTeamUpsert, request: Request):
         close_conn(conn)
 
 
-@app.delete("/project-team/{project_number}/{staff_id}")
-def delete_project_team_row(project_number: str, staff_id: int, request: Request):
+@app.delete("/project-team/{project_identifier}/{staff_id}")
+def delete_project_team_row(
+    project_identifier: str = Path(..., description="project id (numeric), OR project number, OR project name"),
+    staff_id: int = Path(..., ge=1),
+    request: Request = None,
+):
     """
-    Delete a project_team link by (project_number, staff_id).
+    Delete a project_team link by (project_identifier, staff_id).
+    project_identifier can be:
+      - project_id (numeric)
+      - project_number
+      - project_name
     """
     if _extract_api_key(request) != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -1065,7 +1325,8 @@ def delete_project_team_row(project_number: str, staff_id: int, request: Request
     conn = db()
     cur = conn.cursor()
     try:
-        pid = _get_project_id(cur, project_number)
+        ident = _project_identifier_from_path(project_identifier)
+        pid = _resolve_project_id(cur, **ident)
         if not pid:
             return JSONResponse({"error": "project_not_found"}, status_code=404)
 
@@ -1083,12 +1344,51 @@ def delete_project_team_row(project_number: str, staff_id: int, request: Request
         if not row:
             return JSONResponse({"error": "not_found"}, status_code=404)
 
-        return {"ok": True, "project_number": project_number, "staff_id": staff_id}
+        return {"ok": True, "project_id": pid, "staff_id": staff_id}
 
     except Exception as e:
         conn.rollback()
         logger.exception("project_team delete failed")
         return JSONResponse({"error": "project_team_delete_failed", "detail": str(e)}, status_code=500)
+    finally:
+        cur.close()
+        close_conn(conn)
+
+
+# NEW: convenience endpoint for chatbot
+@app.get("/projects/{project_identifier}/team")
+def list_team_for_project(project_identifier: str):
+    """
+    Equivalent to /project-team?project_id=... or project_number=... or project_name=...
+    """
+    conn = db()
+    cur = conn.cursor()
+    try:
+        ident = _project_identifier_from_path(project_identifier)
+        pid = _resolve_project_id(cur, **ident)
+        if not pid:
+            return JSONResponse({"error": "project_not_found"}, status_code=404)
+
+        cur.execute(
+            """
+            select
+                pt.project_id,
+                p.project_number,
+                p.project_name,
+                pt.staff_id,
+                s.first_name,
+                s.last_name,
+                s.role as staff_role,
+                pt.role as role_on_project
+            from public.project_team pt
+            join projects p on p.id = pt.project_id
+            join public.staff s on s.id = pt.staff_id
+            where pt.project_id=%s
+            order by s.last_name asc nulls last, s.first_name asc nulls last
+            """,
+            (pid,),
+        )
+        return rows_to_dicts(cur)
     finally:
         cur.close()
         close_conn(conn)
@@ -1107,6 +1407,7 @@ async def upload_project_file(
     conn = db()
     cur = conn.cursor()
     try:
+        number = (number or "").strip()
         pid = _get_project_id(cur, number)
         if not pid:
             return JSONResponse({"error": "project_not_found"}, status_code=404)
@@ -1181,6 +1482,7 @@ def import_file_from_url(number: str, data: FileImportBody, request: Request):
     conn = db()
     cur = conn.cursor()
     try:
+        number = (number or "").strip()
         pid = _get_project_id(cur, number)
         if not pid:
             return JSONResponse({"error": "project_not_found"}, status_code=404)
@@ -1262,6 +1564,7 @@ def list_project_files(number: str, request: Request):
     conn = db()
     cur = conn.cursor()
     try:
+        number = (number or "").strip()
         pid = _get_project_id(cur, number)
         if not pid:
             return []
@@ -1311,7 +1614,10 @@ def search_images(
     conn = db()
     cur = conn.cursor()
     try:
+        query = (query or "").strip()
         like = f"%{query}%" if query else "%"
+        limit = _clamp_limit(limit, default=10, max_limit=50)
+
         cur.execute(
             """
             select
@@ -1387,6 +1693,7 @@ def download_local_file(number: str, fid: int, request: Request):
     conn = db()
     cur = conn.cursor()
     try:
+        number = (number or "").strip()
         cur.execute("select id from projects where project_number=%s", (number,))
         proj = cur.fetchone()
         if not proj:
@@ -1429,6 +1736,7 @@ def delete_project_file(number: str, file_id: int, request: Request):
     conn = db()
     cur = conn.cursor()
     try:
+        number = (number or "").strip()
         pid = _get_project_id(cur, number)
         if not pid:
             return JSONResponse({"error": "project_not_found"}, status_code=404)
@@ -1524,4 +1832,5 @@ def http_probe(url: str = Query(..., description="URL to probe via HEAD/GET with
         }
     except Exception as e:
         return JSONResponse({"error": "probe_failed", "detail": str(e)}, status_code=500)
+
 
